@@ -1,3 +1,6 @@
 [submodule "libpqxx"]
 	path = libpqxx
 	url = https://github.com/jtv/libpqxx
+[submodule "args"]
+	path = args
+	url = https://github.com/Taywee/args
