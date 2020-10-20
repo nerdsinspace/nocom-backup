@@ -2,6 +2,7 @@
 #include <string>
 #include <variant>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <chrono>
 #include <ranges>
@@ -60,20 +61,43 @@ struct Table {
 
 
 const std::vector<Table> tables = {
-    {"blocks",          Incremental{"created_at"}},
     {"chat",            Incremental{"created_at"}},
     {"dimensions",      Incremental{"ordinal"}},
-    {"hits",            Incremental{"id"}},
     {"last_by_server",  Rewrite{}},
     {"player_sessions", Rewrite{}},
     {"players",         Rewrite{}},
     {"servers",         Incremental{"id"}},
     {"signs",           Incremental{"created_at"}},
-    {"tracks",          Rewrite{}}
+    {"tracks",          Rewrite{}},
+    {"hits",            Incremental{"id"}},
+    {"blocks",          Incremental{"created_at"}}
+};
+
+using i16 = int16_t;
+using i32 = int32_t;
+using i64 = int64_t;
+
+struct placeholder {};
+
+using Hits =           std::tuple<i64, i64, i32, i32, i32, i32, i32, bool, i32>;
+using Blocks =         std::tuple<i32, i16, i32, i32, i64, i16, i16>;
+using Tracks =         std::tuple<i32, i64, i64, i64, std::optional<i32>, i16, i16, bool>;
+using Signs =          std::tuple<i32, i16, i32, std::vector<std::byte>, i16, i16>;
+using Servers =        std::tuple<i16, std::string>;
+using Players =        std::tuple<i32, std::byte[16], std::string>;
+using PlayerSessions = std::tuple<i32, i16, std::optional<i64>, placeholder/*range*/, bool>;
+using LastByServer =   std::tuple<i16, i64>;
+using Dimensions =     std::tuple<i32, std::string>;
+using Chat =           std::tuple<std::string/*json*/, i16, i32, i64, i16>;
+// TODO: define full schema for sanity checking
+
+enum class UpdateType : char {
+    Create,
+    Delete
 };
 
 std::string selectNewestQuery(const std::string& table, const Incremental& inc, const std::string& oldValue) {
-    return "SELECT * FROM "s + table + "WHERE "s + inc.column + " > "s + oldValue;
+    return "SELECT * FROM "s + table + " WHERE "s + inc.column + " > "s + oldValue;
 }
 
 std::string selectAllQuery(const std::string& table) {
@@ -82,6 +106,8 @@ std::string selectAllQuery(const std::string& table) {
 
 void outputTable(const fs::path& file, const pqxx::result& result) {
     std::cout << "Outputting table to " << file.string() << '\n';
+    std::ofstream out(file);
+    out << "This table has " << result.size() << " rows uwu\n";
 }
 
 void runBackup(pqxx::connection& db, const fs::path& rootOutput, const Table& table) {
@@ -89,11 +115,12 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput, const Table& ta
     const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     const fs::path outDir = rootOutput / std::to_string(millis);
     std::cout << "Creating output directory at " << outDir << '\n';
+    fs::create_directory(outDir);
 
     std::string query;
     std::visit(overloaded {
         [&](const Incremental& inc) {
-            query = selectNewestQuery(table.name, inc, "666");
+            query = selectNewestQuery(table.name, inc, "-10");
         },
         [&](Rewrite) {
             query = selectAllQuery(table.name);
@@ -108,21 +135,20 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput, const Table& ta
 
 int main(int argc, char** argv)
 {
-
     try
     {
-        pqxx::connection C;
-        std::cout << "Connected to " << C.dbname() << std::endl;
-        pqxx::work W{C};
+        pqxx::connection con;
+        std::cout << "Connected to " << con.dbname() << std::endl;
 
-        pqxx::result R = W.exec("select max(id) from hits");
+        const fs::path out{"output"};
+        fs::create_directories(out);
 
-        std::cout << "Found " << R.size() << " results:\n";
-        for (auto row: R)
-            std::cout << row[0].c_str() << '\n';
+        for (const Table& table : tables) {
+            if (table.name == "dimensions")
+                runBackup(con, out, table);
+        }
 
-        W.commit();
-        std::cout << "OK.\n";
+        std::cout << "Done.\n";
     }
     catch (std::exception const &e)
     {
