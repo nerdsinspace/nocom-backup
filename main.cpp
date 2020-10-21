@@ -62,7 +62,7 @@ using Tracks =         std::tuple<i32, i64, i64, i64, std::optional<i32>, i16, i
 using Signs =          std::tuple<i32, i16, i32, pqxx::binarystring, i16, i16>; // I don't like this binarystring
 using Servers =        std::tuple<i16, std::string>;
 using Players =        std::tuple<i32, UUID, std::string>;
-using PlayerSessions = std::tuple<i32, i16, std::optional<i64>, placeholder/*range*/, bool>;
+using PlayerSessions = std::tuple<i32, i16, uint64_t, std::optional<i64>, placeholder/*range*/, bool>;
 using LastByServer =   std::tuple<i16, i64>;
 using Dimensions =     std::tuple<i32, std::string>;
 using Chat =           std::tuple<std::string/*json*/, i16, i32, i64, i16>;
@@ -83,6 +83,11 @@ template<typename>
 constexpr bool is_tuple = false;
 template<typename... Ts>
 constexpr bool is_tuple<std::tuple<Ts...>> = true;
+
+template<typename>
+constexpr bool is_optional = false;
+template<typename T>
+constexpr bool is_optional<std::optional<T>> = true;
 
 template<typename Tuple> requires is_tuple<Tuple>
 struct Table {
@@ -120,6 +125,15 @@ struct ParseField<std::optional<T>> {
     }
 };
 
+template<typename T>
+auto getField(const pqxx::row& row, size_t index) {
+    std::optional maybe =  ParseField<T>{}(row.at(index));
+    if constexpr (is_optional<T>) {
+        return maybe;
+    } else {
+        return std::move(maybe.value());
+    }
+}
 
 template<typename Tuple> requires is_tuple<Tuple>
 Tuple rowToTuple(const pqxx::row& row) {
@@ -127,9 +141,8 @@ Tuple rowToTuple(const pqxx::row& row) {
         throw std::runtime_error("row size wrong!!");
     }
 
-    // TODO: std::optional needs to be treated differently
     return [&row]<size_t... I>(std::index_sequence<I...>) {
-        return std::make_tuple(ParseField<std::tuple_element_t<I, Tuple>>{}(row.at(I)).value()...);
+        return std::make_tuple(getField<std::tuple_element_t<I, Tuple>>(row, I)...);
     }(std::make_index_sequence<std::tuple_size_v<Tuple>>{});
 }
 
