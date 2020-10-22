@@ -12,6 +12,7 @@
 #include <args.hxx>
 
 #include "pqxx_extensions.h"
+#include "tables.h"
 
 
 namespace fs = std::filesystem;
@@ -50,20 +51,7 @@ std::optional<fs::path> getYesterdayDiff(const fs::path& dir) {
 template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
 template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
-using i16 = int16_t;
-using i32 = int32_t;
-using i64 = int64_t;
 
-using Hits =           std::tuple<i64, i64, i32, i32, i32, i32, i32, bool, i32>;
-using Blocks =         std::tuple<i32, i16, i32, i32, i64, i16, i16>;
-using Tracks =         std::tuple<i32, i64, i64, i64, std::optional<i32>, i16, i16, bool>;
-using Signs =          std::tuple<i32, i16, i32, pqxx::binarystring, i64, i16, i16>; // I don't like this binarystring
-using Servers =        std::tuple<i16, std::string>;
-using Players =        std::tuple<i32, UUID, std::string>;
-using PlayerSessions = std::tuple<i32, i16, uint64_t, std::optional<i64>, placeholder/*range*/, bool>;
-using LastByServer =   std::tuple<i16, i64>;
-using Dimensions =     std::tuple<i32, std::string>;
-using Chat =           std::tuple<std::string/*json*/, i16, i32, i64, i16>;
 // TODO: define full schema for sanity checking
 
 enum class UpdateType : char {
@@ -71,11 +59,6 @@ enum class UpdateType : char {
     Delete
 };
 
-struct Incremental {
-    std::string column; // Column the table is sorted by and will be used in query
-};
-
-struct Rewrite {};
 
 template<typename>
 constexpr bool is_tuple = false;
@@ -87,25 +70,19 @@ constexpr bool is_optional = false;
 template<typename T>
 constexpr bool is_optional<std::optional<T>> = true;
 
-template<typename Tuple> requires is_tuple<Tuple>
-struct Table {
-    using tuple_type = Tuple;
-    std::string name;
-    std::variant<Incremental, Rewrite> info;
-};
 
 
 const auto tables = std::make_tuple(
-    Table<Chat>          {"chat",            Incremental{"created_at"}},
-    Table<Dimensions>    {"dimensions",      Incremental{"ordinal"}},
-    Table<LastByServer>  {"last_by_server",  Rewrite{}},
-    Table<PlayerSessions>{"player_sessions", Rewrite{}},
-    Table<Players>       {"players",         Rewrite{}},
-    Table<Servers>       {"servers",         Incremental{"id"}},
-    Table<Signs>         {"signs",           Incremental{"created_at"}},
-    Table<Tracks>        {"tracks",          Rewrite{}},
-    Table<Hits>          {"hits",            Incremental{"id"}},
-    Table<Blocks>        {"blocks",          Incremental{"created_at"}}
+    Chat          {"chat",            Incremental{"created_at"}},
+    Dimensions    {"dimensions",      Incremental{"ordinal"}},
+    LastByServer  {"last_by_server",  Rewrite{}},
+    PlayerSessions{"player_sessions", Rewrite{}},
+    Players       {"players",         Rewrite{}},
+    Servers       {"servers",         Incremental{"id"}},
+    Signs         {"signs",           Incremental{"created_at"}},
+    Tracks        {"tracks",          Rewrite{}},
+    Hits          {"hits",            Incremental{"id"}},
+    Blocks        {"blocks",          Incremental{"created_at"}}
 );
 
 
@@ -166,7 +143,7 @@ void serialize(std::pmr::vector<char>& vec, std::string_view str) {
 }
 
 template<typename T>
-void serialize(std::pmr::vector<char>& vec, const std::optional<T> optional) {
+void serialize(std::pmr::vector<char>& vec, const std::optional<T>& optional) {
     serialize(vec, optional.has_value());
     if (optional) serialize(vec, *optional);
 }
@@ -206,12 +183,32 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
     }
 }
 
-std::string selectNewestQuery(const std::string& table, const Incremental& inc, const std::string& oldValue) {
-    return "SELECT * FROM "s + table + " WHERE "s + inc.column + " > "s + oldValue;
+template<typename>
+struct ColumnNamesImpl;
+
+template<typename... Columns>
+struct ColumnNamesImpl<Table<Columns...>> {
+    static std::string get() {
+        std::string str = ((std::string{Columns::name} + ", ") + ...);
+        str.pop_back();
+        str.pop_back();
+        return str;
+    }
+};
+
+template<typename Table_t>
+std::string columnNames() {
+    return ColumnNamesImpl<Table_t>::get();
 }
 
+template<typename Table_t>
+std::string selectNewestQuery(const std::string& table, const Incremental& inc, const std::string& oldValue) {
+    return "SELECT "s + columnNames<Table_t>()  + " FROM "s + table + " WHERE "s + inc.column + " > "s + oldValue;
+}
+
+template<typename Table_t>
 std::string selectAllQuery(const std::string& table) {
-    return "SELECT * FROM "s + table;
+    return "SELECT "s + columnNames<Table_t>()  + " FROM "s + table;
 }
 
 void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
@@ -222,22 +219,21 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
     fs::create_directory(outDir);
 
 
-    const auto output = [&]<typename Tuple>(const Table<Tuple>& table) {
-        //f (table.name != "player_sessions") return;
+    const auto output = [&]<typename T>(const T& table) {
         std::string query;
         std::visit(overloaded {
             [&](const Incremental& inc) {
-                query = selectNewestQuery(table.name, inc, "-10");
+                query = selectNewestQuery<T>(table.name, inc, "-10");
             },
             [&](Rewrite) {
-                query = selectAllQuery(table.name);
+                query = selectAllQuery<T>(table.name);
             }
         }, table.info);
         query += " limit 1";
 
         pqxx::result result = pqxx::work{db}.exec(query);
 
-        outputTable<Tuple>(outDir / table.name, result);
+        outputTable<typename T::tuple>(outDir / table.name, result);
     };
 
     std::apply([&](const auto&... table) {
