@@ -5,11 +5,9 @@
 #include <fstream>
 #include <optional>
 #include <chrono>
-#include <ranges>
 #include <memory_resource>
 #include <vector>
 
-#define PQXX_HAVE_CONCEPTS
 #include <pqxx/pqxx>
 #include <args.hxx>
 
@@ -33,7 +31,7 @@ std::optional<fs::path> getYesterdayDiff(const fs::path& dir) {
     std::vector<fs::path> paths;
     for (auto& p : fs::directory_iterator{dir}) {
         if (filenameAsTimestamp(p).has_value()) {
-            paths.push_back(std::move(p));
+            paths.push_back(p);
         }
     }
 
@@ -43,7 +41,7 @@ std::optional<fs::path> getYesterdayDiff(const fs::path& dir) {
 
     const auto maxIter = std::ranges::max_element(paths, cmp);
     if (maxIter != paths.end()) {
-        return *maxIter;
+        return std::move(*maxIter);
     } else {
         return {};
     }
@@ -59,7 +57,7 @@ using i64 = int64_t;
 using Hits =           std::tuple<i64, i64, i32, i32, i32, i32, i32, bool, i32>;
 using Blocks =         std::tuple<i32, i16, i32, i32, i64, i16, i16>;
 using Tracks =         std::tuple<i32, i64, i64, i64, std::optional<i32>, i16, i16, bool>;
-using Signs =          std::tuple<i32, i16, i32, pqxx::binarystring, i16, i16>; // I don't like this binarystring
+using Signs =          std::tuple<i32, i16, i32, pqxx::binarystring, i64, i16, i16>; // I don't like this binarystring
 using Servers =        std::tuple<i16, std::string>;
 using Players =        std::tuple<i32, UUID, std::string>;
 using PlayerSessions = std::tuple<i32, i16, uint64_t, std::optional<i64>, placeholder/*range*/, bool>;
@@ -205,9 +203,6 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
         serializeTupleToBuffer(dim, buffer);
         std::cout << "writing " << buffer.size() << " bytes to file\n";
         out.write(&buffer[0], buffer.size());
-
-        //std::cout << "Ordinal = " << std::get<0>(dim) << '\n';
-        //std::cout << "Name = " << std::get<1>(dim) << '\n';
     }
 }
 
@@ -228,7 +223,7 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
 
 
     const auto output = [&]<typename Tuple>(const Table<Tuple>& table) {
-        if (table.name != "players") return;
+        //f (table.name != "player_sessions") return;
         std::string query;
         std::visit(overloaded {
             [&](const Incremental& inc) {
@@ -252,8 +247,7 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
 
 int main(int argc, char** argv)
 {
-    try
-    {
+    try {
         pqxx::connection con;
         std::cout << "Connected to " << con.dbname() << std::endl;
 
@@ -268,8 +262,7 @@ int main(int argc, char** argv)
 
         std::cout << "Done.\n";
     }
-    catch (std::exception const &e)
-    {
+    catch (std::exception const &e) {
         std::cerr << e.what() << '\n';
         return 1;
     }
