@@ -29,7 +29,7 @@ struct Serializable<T> {
 
     static T deserialize(std::ifstream& in) {
         T out;
-        in.read(reinterpret_cast<char*>(out), sizeof(T));
+        in.read(reinterpret_cast<char*>(&out), sizeof(T));
         return out;
     }
 };
