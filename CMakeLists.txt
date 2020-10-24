@@ -8,7 +8,7 @@ find_package(libpqxx REQUIRED)
 
 add_subdirectory(args)
 
-add_executable(nocom_backup main.cpp pqxx_extensions.h tables.h)
+add_executable(nocom_backup main.cpp pqxx_extensions.h tables.h serialization.h)
 
 target_link_libraries(nocom_backup libpqxx::pqxx)
 target_link_libraries(nocom_backup args)

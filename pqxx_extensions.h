@@ -40,7 +40,7 @@ namespace pqxx {
             for (char c : text) {
                 if (c != '-') hex.push_back(c);
             }
-            if (hex.size() != 32) throw std::runtime_error("bad uuid string");
+            if (hex.size() > 32) throw std::runtime_error("bad uuid string");
 
             UUID uuid{};
             for (int i = 0; i < 16; i += 2) {

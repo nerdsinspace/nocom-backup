@@ -7,8 +7,9 @@
 #include "pqxx_extensions.h"
 
 
+template<typename Column>
 struct Incremental {
-    std::string column; // Column the table is sorted by and will be used in query
+    using column = Column; // Column the table is sorted by and will be used in query
 };
 
 struct Rewrite {};
@@ -16,8 +17,9 @@ struct Rewrite {};
 template<typename... Columns>
 struct Table {
     using tuple = std::tuple<typename Columns::type...>;
+    using base_type = Table<Columns...>; // Inheritance breaks specialization so we use this
+
     std::string name;
-    std::variant<Incremental, Rewrite> info;
 };
 
 // this might be useless
@@ -138,13 +140,43 @@ struct ReportedBy : Column<int32_t> {
     static constexpr std::string_view name = "reported_by";
 };
 
-using Hits =           Table<Id, CreatedAt, X, Z, Dimension, ServerId, Legacy, TrackId>;
-using Blocks =         Table<X, Y, Z, BlockState, CreatedAt, Dimension, ServerId>;
-using Tracks =         Table<Id, FirstHitID, LastHitId, UpdatedAt, PrevTrackId, Dimension, ServerId, Legacy>;
-using Signs =          Table<X, Y, Z, Nbt, CreatedAt, Dimension, ServerId>;
-using Servers =        Table<Servers_Id, Hostname>;
-using Players =        Table<Id, Uuid, Username>;
-using PlayerSessions = Table<PlayerId, ServerId, Join, Leave, Range, Legacy>;
-using LastByServer =   Table<ServerId, CreatedAt>;
-using Dimensions =     Table<Ordinal, Name>;
-using Chat =           Table<Data, ChatType, ReportedBy, CreatedAt, ServerId>;
+struct Hits : Table<Id, CreatedAt, X, Z, Dimension, ServerId, Legacy, TrackId> {
+    //static constexpr std::string_view name = "hits";
+    using table_type = Incremental<Id>;
+};
+
+struct Blocks : Table<X, Y, Z, BlockState, CreatedAt, Dimension, ServerId> {
+    using table_type = Incremental<CreatedAt>;
+};
+
+struct Tracks : Table<Id, FirstHitID, LastHitId, UpdatedAt, PrevTrackId, Dimension, ServerId, Legacy> {
+    using table_type = Rewrite;
+};
+
+struct Signs : Table<X, Y, Z, Nbt, CreatedAt, Dimension, ServerId> {
+    using table_type = Incremental<CreatedAt>;
+};
+
+struct Servers : Table<Servers_Id, Hostname> {
+    using table_type = Incremental<Servers_Id>;
+};
+
+struct Players : Table<Id, Uuid, Username> {
+    using table_type = Rewrite;
+};
+
+struct PlayerSessions : Table<PlayerId, ServerId, Join, Leave, Range, Legacy> {
+    using table_type = Rewrite;
+};
+
+struct LastByServer : Table<ServerId, CreatedAt> {
+    using table_type = Rewrite;
+};
+
+struct Dimensions : Table<Ordinal, Name> {
+    using table_type = Incremental<Ordinal>;
+};
+
+struct Chat : Table<Data, ChatType, ReportedBy, CreatedAt, ServerId> {
+    using table_type = Incremental<CreatedAt>;
+};
