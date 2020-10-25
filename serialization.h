@@ -61,7 +61,7 @@ struct Serializable<std::string> : Serializable<std::string_view> {};
 template<typename T>
 struct Serializable<std::optional<T>> {
     static void serialize(std::pmr::vector<char>& vec, const std::optional<T>& optional) {
-        Serializable<T>::serialize(vec, optional.has_value());
+        Serializable<bool>::serialize(vec, optional.has_value());
         if (optional) Serializable<T>::serialize(vec, *optional);
     }
 

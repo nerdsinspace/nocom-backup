@@ -49,9 +49,6 @@ std::optional<fs::path> getNewestDiff(const fs::path& dir) {
     }
 }
 
-template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
-template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
-
 
 enum class UpdateType : char {
     Create,
@@ -92,6 +89,7 @@ constexpr bool is_incremental<Incremental<T>> = true;
 
 // TODO: make table names constexpr
 const auto tables = std::make_tuple(
+    Hits          {"hits"},
     Chat          {"chat"},
     Dimensions    {"dimensions"},
     LastByServer  {"last_by_server"},
@@ -100,7 +98,7 @@ const auto tables = std::make_tuple(
     Servers       {"servers"},
     Signs         {"signs"},
     Tracks        {"tracks"},
-    Hits          {"hits"},
+    //Hits          {"hits"},
     Blocks        {"blocks"}
 );
 
@@ -141,7 +139,6 @@ Tuple rowToTuple(const pqxx::row& row) {
 }
 
 
-
 template<typename Tuple> requires is_tuple<Tuple>
 void serializeTupleToBuffer(const Tuple& tuple, std::pmr::vector<char>& vec) {
     std::apply([&vec]<typename... T>(const T&... x) {
@@ -155,38 +152,45 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
     std::ofstream out(file, std::ios_base::out | std::ios_base::binary);
     out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
+    const Header h{result.size()};
+    out.write(reinterpret_cast<const char*>(&h), sizeof(h));
+
     for (const pqxx::row& row : result) {
-        const auto dim = rowToTuple<Tuple>(row);
+        const auto tuple = rowToTuple<Tuple>(row);
         char allocator_buffer[1000000]; // should be more than enough for any row
+        // this looks like it generates bad code so I might replace this with something simpler
         std::pmr::monotonic_buffer_resource resource(allocator_buffer, sizeof(allocator_buffer));
         std::pmr::vector<char> buffer{&resource};
         buffer.reserve(sizeof(allocator_buffer));
 
-        serializeTupleToBuffer(dim, buffer);
-        std::cout << "writing " << buffer.size() << " bytes to file\n";
+        serializeTupleToBuffer(tuple, buffer);
+        //std::cout << "writing " << buffer.size() << " bytes to file\n";
         out.write(&buffer[0], buffer.size());
     }
 }
 
+template<typename T, typename... Rest>
+std::tuple<T, Rest...> readTuple0(std::ifstream& in) {
+    std::tuple<T> x{Serializable<T>::deserialize(in)};
+    if constexpr (sizeof...(Rest) > 0) {
+        return std::tuple_cat(std::move(x), readTuple0<Rest...>(in));
+    } else {
+        return x;
+    }
+}
+
 template<typename>
-struct tuple_storage;
+struct ReadTupleImpl;
 template<typename... T>
-struct tuple_storage<std::tuple<T...>> {
-    using type = std::tuple<std::aligned_storage_t<sizeof(T), alignof(T)>...>;
+struct ReadTupleImpl<std::tuple<T...>> {
+    static std::tuple<T...> impl(std::ifstream& in) {
+        return readTuple0<T...>(in);
+    }
 };
 
 template<typename Tuple>
 Tuple readTuple(std::ifstream& in) {
-    // have to assign to this rather than construct because order of evaluation is undefined
-    using storage = typename tuple_storage<Tuple>::type;
-    storage out;
-    [&]<size_t... I>(std::index_sequence<I...>) {
-        ((new (reinterpret_cast<void*>(&std::get<I>(out))) std::tuple_element_t<I, Tuple>{Serializable<std::tuple_element_t<I, Tuple>>::deserialize(in)}), ...);
-    }(std::make_index_sequence<std::tuple_size_v<Tuple>>{});
-
-    return [&]<size_t... I>(std::index_sequence<I...>) {
-        return std::make_tuple(*std::launder(reinterpret_cast<std::tuple_element_t<I, Tuple>*>(&std::get<I>(out)))...);
-    }(std::make_index_sequence<std::tuple_size_v<Tuple>>{});
+    return ReadTupleImpl<Tuple>::impl(in);
 }
 
 template<typename TABLE>
@@ -197,10 +201,11 @@ std::optional<typename TABLE::tuple> readNewestRow(const TABLE& table, const fs:
 
     Header header{};
     in.read(reinterpret_cast<char*>(&header), sizeof(header));
+    header.checkVersion();
     if (header.numRows > 0) {
         return readTuple<typename TABLE::tuple>(in);
     } else {
-        // This should never happen for a table like hits but dimensions will almost always be empty
+        // This should never happen for a table like hits but dimensions will almost always be empty after the first diff
         return {};
     }
 }
@@ -251,7 +256,8 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
         if constexpr (is_incremental<typename T::table_type>) {
             if (lastDiff.has_value()) {
                 const std::tuple newest = readNewestRow(table, *lastDiff);
-                query = selectNewestQuery<T>(table.name, "-10");
+                using column = typename T::table_type::column;
+                query = selectNewestQuery<T>(table.name, std::string{column::name});
             } else {
                 query = selectAllQuery<T>(table.name);
             }
@@ -260,9 +266,10 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
         } else {
             throw std::logic_error{"unhandled type"};
         }
-        query += " limit 1";
+        query += " limit 1000000";
 
         pqxx::result result = pqxx::work{db}.exec(query);
+        std::cout << result.size() << " rows\n";
 
         outputTable<typename T::tuple>(outDir / table.name, result);
     };
@@ -282,10 +289,10 @@ int main(int argc, char** argv)
         fs::create_directories(out);
 
         runBackup(con, out);
-        pqxx::work work{con};
-        pqxx::result result = work.exec("select * from Players limit 1");
-        for (auto row: result)
-            std::cout << row[1].c_str() << '\n';
+        //pqxx::work work{con};
+        //pqxx::result result = work.exec("select * from Players limit 1");
+        //for (auto row: result)
+        //    std::cout << row[1].c_str() << '\n';
 
         std::cout << "Done.\n";
     }

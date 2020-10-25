@@ -28,9 +28,14 @@ struct Column {
     using type = T;
 };
 
-struct Id : Column<int32_t> {
+template<typename T> requires std::is_integral_v<T>
+struct Id : Column<T> {
     static constexpr std::string_view name = "id";
 };
+
+using Id32 = Id<int32_t>;
+using Id64 = Id<int64_t>;
+using Id16 = Id<int16_t>;
 
 struct X : Column<int32_t> {
     static constexpr std::string_view name = "x";
@@ -60,7 +65,7 @@ struct Legacy : Column<bool> {
     static constexpr std::string_view name = "legacy";
 };
 
-struct TrackId : Column<int32_t> {
+struct TrackId : Column<std::optional<int32_t>> {
     static constexpr std::string_view name = "track_id";
 };
 
@@ -88,10 +93,6 @@ struct Nbt : Column<pqxx::binarystring> {
     static constexpr std::string_view name = "nbt";
 };
 
-struct Servers_Id : Column<int16_t> {
-    static constexpr std::string_view name = "id";
-};
-
 struct Hostname : Column<std::string> {
     static constexpr std::string_view name = "hostname";
 };
@@ -100,7 +101,7 @@ struct Uuid : Column<UUID> {
     static constexpr std::string_view name = "uuid";
 };
 
-struct Username : Column<std::string> {
+struct Username : Column<std::optional<std::string>> {
     static constexpr std::string_view name = "username";
 };
 
@@ -140,16 +141,16 @@ struct ReportedBy : Column<int32_t> {
     static constexpr std::string_view name = "reported_by";
 };
 
-struct Hits : Table<Id, CreatedAt, X, Z, Dimension, ServerId, Legacy, TrackId> {
+struct Hits : Table<Id64, CreatedAt, X, Z, Dimension, ServerId, Legacy, TrackId> {
     //static constexpr std::string_view name = "hits";
-    using table_type = Incremental<Id>;
+    using table_type = Incremental<Id64>;
 };
 
 struct Blocks : Table<X, Y, Z, BlockState, CreatedAt, Dimension, ServerId> {
     using table_type = Incremental<CreatedAt>;
 };
 
-struct Tracks : Table<Id, FirstHitID, LastHitId, UpdatedAt, PrevTrackId, Dimension, ServerId, Legacy> {
+struct Tracks : Table<Id32, FirstHitID, LastHitId, UpdatedAt, PrevTrackId, Dimension, ServerId, Legacy> {
     using table_type = Rewrite;
 };
 
@@ -157,11 +158,11 @@ struct Signs : Table<X, Y, Z, Nbt, CreatedAt, Dimension, ServerId> {
     using table_type = Incremental<CreatedAt>;
 };
 
-struct Servers : Table<Servers_Id, Hostname> {
-    using table_type = Incremental<Servers_Id>;
+struct Servers : Table<Id16, Hostname> {
+    using table_type = Incremental<Id16>;
 };
 
-struct Players : Table<Id, Uuid, Username> {
+struct Players : Table<Id32, Uuid, Username> {
     using table_type = Rewrite;
 };
 
