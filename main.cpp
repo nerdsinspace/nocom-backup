@@ -146,14 +146,24 @@ void serializeTupleToBuffer(const Tuple& tuple, std::pmr::vector<char>& vec) {
     }, tuple);
 }
 
+void writeHeader(std::ofstream& out, int rows) {
+    const Header h{rows};
+    out.write(reinterpret_cast<const char*>(&h), sizeof(h));
+}
+
+void writeHeader(const fs::path& file, int rows) {
+    std::ofstream out(file, std::ios_base::out | std::ios_base::binary);
+    out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
+    writeHeader(out, rows);
+}
+
 template<typename Tuple> requires is_tuple<Tuple>
 void outputTable(const fs::path& file, const pqxx::result& result) {
     std::cout << "Outputting table to " << file.string() << '\n';
     std::ofstream out(file, std::ios_base::out | std::ios_base::binary);
     out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
-    const Header h{result.size()};
-    out.write(reinterpret_cast<const char*>(&h), sizeof(h));
+    writeHeader(out, result.size());
 
     for (const pqxx::row& row : result) {
         const auto tuple = rowToTuple<Tuple>(row);
@@ -163,8 +173,9 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
         std::pmr::vector<char> buffer{&resource};
         buffer.reserve(sizeof(allocator_buffer));
 
+        // I can potentially remove this for incremental tables
+        Serializable<UpdateType>::serialize(buffer, UpdateType::Create);
         serializeTupleToBuffer(tuple, buffer);
-        //std::cout << "writing " << buffer.size() << " bytes to file\n";
         out.write(&buffer[0], buffer.size());
     }
 }
@@ -192,6 +203,22 @@ template<typename Tuple>
 Tuple readTuple(std::ifstream& in) {
     return ReadTupleImpl<Tuple>::impl(in);
 }
+
+template<typename>
+struct TableIndexOf;
+template<typename... Ts>
+struct TableIndexOf<Table<Ts...>> {
+    template<typename T>
+    static consteval size_t get() {
+        constexpr bool results[]{std::is_same_v<T, Ts>...};
+        for (size_t i = 0; i < std::size(results); i++) {
+            if (results[i]) return i;
+        }
+        return -1;
+        // this throw should be valid but gcc doesnt like it
+        //throw "type not in table";
+    }
+};
 
 template<typename TABLE>
 std::optional<typename TABLE::tuple> readNewestRow(const TABLE& table, const fs::path& diffPath) {
@@ -234,7 +261,17 @@ std::string columnNames() {
 template<typename TABLE> requires is_incremental<typename TABLE::table_type>
 std::string selectNewestQuery(const std::string& table, const std::string& oldValue) {
     std::string columnName{TABLE::table_type::column::name};
-    return "SELECT "s + columnNames<TABLE>()  + " FROM "s + table + " WHERE "s + columnName + " > "s + oldValue;
+    return "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue;
+}
+
+std::string sortedResults(const std::string& query, const std::string& column) {
+    return "SELECT * FROM (" + query + ") AS UWU ORDER BY " + column + " DESC";
+}
+
+template<typename TABLE> requires is_incremental<typename TABLE::table_type>
+std::string sortedResults(const std::string& query) {
+    std::string columnName{TABLE::table_type::column::name};
+    return sortedResults(query, columnName);
 }
 
 template<typename TABLE>
@@ -252,26 +289,39 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
     fs::create_directory(outDir);
 
     const auto output = [&]<typename T>(const T& table) {
+        const fs::path tableFile = outDir / table.name;
+
         std::string query;
         if constexpr (is_incremental<typename T::table_type>) {
             if (lastDiff.has_value()) {
-                const std::tuple newest = readNewestRow(table, *lastDiff);
+                const std::optional newestRow = readNewestRow(table, *lastDiff);
+                if (!newestRow) {
+                    // if there are no new rows we write a file with just the header
+                    // TODO: might want to just write nothing at all
+                    writeHeader(tableFile, 0);
+                    return;
+                }
                 using column = typename T::table_type::column;
-                query = selectNewestQuery<T>(table.name, std::string{column::name});
+                constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
+                const auto newest = std::get<tupleIndex>(newestRow.value());
+                query = selectNewestQuery<T>(table.name, std::to_string(newest));
             } else {
                 query = selectAllQuery<T>(table.name);
             }
+
+            query += " limit 10000000";
+            query = sortedResults<T>(query);
         } else if constexpr (std::is_same_v<typename T::table_type, Rewrite>) {
             query = selectAllQuery<T>(table.name);
+            query += " limit 10000000";
         } else {
             throw std::logic_error{"unhandled type"};
         }
-        query += " limit 1000000";
 
         pqxx::result result = pqxx::work{db}.exec(query);
         std::cout << result.size() << " rows\n";
 
-        outputTable<typename T::tuple>(outDir / table.name, result);
+        outputTable<typename T::tuple>(tableFile, result);
     };
 
     std::apply([&](const auto&... table) {

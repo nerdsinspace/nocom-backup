@@ -7,14 +7,14 @@
 #include "pqxx_extensions.h"
 
 
-template<typename Column>
+template<typename Column> requires std::is_arithmetic_v<typename Column::type>
 struct Incremental {
     using column = Column; // Column the table is sorted by and will be used in query
 };
 
 struct Rewrite {};
 
-template<typename... Columns>
+template<typename... Columns> // TODO: make sure there are no duplicate types
 struct Table {
     using tuple = std::tuple<typename Columns::type...>;
     using base_type = Table<Columns...>; // Inheritance breaks specialization so we use this
