@@ -20,36 +20,6 @@ namespace fs = std::filesystem;
 using namespace std::literals;
 
 
-std::optional<uint64_t> filenameAsTimestamp(const fs::path& path) {
-    const fs::path name = path.filename().stem(); // strip extension
-    try {
-        return std::stoi(name.native());
-    } catch (...) {
-        return {};
-    }
-}
-
-std::optional<fs::path> getNewestDiff(const fs::path& dir) {
-    std::vector<fs::path> paths;
-    for (auto& p : fs::directory_iterator{dir}) {
-        if (filenameAsTimestamp(p).has_value()) {
-            paths.push_back(p);
-        }
-    }
-
-    const auto cmp = [](const fs::path& a, const fs::path& b) {
-        return filenameAsTimestamp(a).value() < filenameAsTimestamp(b).value();
-    };
-
-    const auto maxIter = std::ranges::max_element(paths, cmp);
-    if (maxIter != paths.end()) {
-        return std::move(*maxIter);
-    } else {
-        return {};
-    }
-}
-
-
 enum class UpdateType : char {
     Create,
     Delete
@@ -101,6 +71,68 @@ const auto tables = std::make_tuple(
     //Hits          {"hits"},
     Blocks        {"blocks"}
 );
+
+
+std::optional<uint64_t> filenameAsTimestamp(const fs::path& path) {
+    const fs::path name = path.filename().stem(); // strip extension
+    try {
+        return std::stoi(name.native());
+    } catch (...) {
+        return {};
+    }
+}
+
+std::vector<fs::path> getOldOutputsSorted(const fs::path& dir) {
+    std::vector<fs::path> paths;
+    for (auto& p : fs::directory_iterator{dir}) {
+        if (filenameAsTimestamp(p).has_value()) {
+            paths.push_back(p);
+        }
+    }
+    const auto cmp = [](const fs::path& a, const fs::path& b) {
+        return filenameAsTimestamp(a).value() < filenameAsTimestamp(b).value();
+    };
+    std::ranges::sort(paths, cmp);
+    return paths;
+}
+
+std::optional<fs::path> getNewestOutput(const fs::path& dir) {
+    std::vector<fs::path> paths = getOldOutputsSorted(dir);
+    if (!paths.empty()) {
+        return std::move(paths.back());
+    } else {
+        return {};
+    }
+}
+
+Header readHeader(const fs::path& file) {
+    std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
+    in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
+    Header h{};
+    in.read(reinterpret_cast<char*>(&h), sizeof(h));
+    return h;
+}
+
+std::optional<fs::path> getNewestNonEmptyDiffForTable(const fs::path& dir, std::string_view tableName) {
+    const std::vector<fs::path> paths = getOldOutputsSorted(dir);
+    for (const auto& p : paths) {
+        const auto tableFile = dir / tableName;
+        if (!fs::exists(p)) {
+            std::cerr << "Warning: old output (" << p.string() << ") does not contain file for " << tableName << '\n';
+        } else {
+            const Header h = readHeader(p);
+            if (h.version != Header::CURRENT_VERSION) {
+                // TODO: handle this better?
+                break;
+            }
+            if (h.numRows > 0) {
+                return p;
+            }
+        }
+    }
+
+    return {};
+}
 
 
 template<typename T>
@@ -221,8 +253,7 @@ struct TableIndexOf<Table<Ts...>> {
 };
 
 template<typename TABLE>
-std::optional<typename TABLE::tuple> readNewestRow(const TABLE& table, const fs::path& diffPath) {
-    const fs::path file = diffPath / table.name;
+std::optional<typename TABLE::tuple> readNewestRow(const fs::path& file) {
     std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
     in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
@@ -240,7 +271,6 @@ std::optional<typename TABLE::tuple> readNewestRow(const TABLE& table, const fs:
 
 template<typename>
 struct ColumnNamesImpl;
-
 template<typename... Columns>
 struct ColumnNamesImpl<Table<Columns...>> {
     static std::string get() {
@@ -279,32 +309,33 @@ std::string selectAllQuery(const std::string& table) {
     return "SELECT "s + columnNames<TABLE>() + " FROM "s + table;
 }
 
-void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
+// returns the largest number of rows returned by a query
+int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
     const auto now = std::chrono::system_clock::now();
     const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     const fs::path outDir = rootOutput / std::to_string(millis);
-    const std::optional<fs::path> lastDiff = getNewestDiff(rootOutput);
+    //const std::optional<fs::path> lastDiff = getNewestOutput(rootOutput);
 
     std::cout << "Creating output directory at " << outDir << '\n';
     fs::create_directory(outDir);
 
-    const auto output = [&]<typename T>(const T& table) {
+    const auto output = [&]<typename T>(const T& table) -> int {
         const fs::path tableFile = outDir / table.name;
 
         std::string query;
         if constexpr (is_incremental<typename T::table_type>) {
+            const std::optional<fs::path> lastDiff = getNewestNonEmptyDiffForTable(rootOutput, table.name);
             if (lastDiff.has_value()) {
-                const std::optional newestRow = readNewestRow(table, *lastDiff);
-                if (!newestRow) {
-                    // if there are no new rows we write a file with just the header
-                    // TODO: might want to just write nothing at all
-                    writeHeader(tableFile, 0);
-                    return;
+                const std::optional newestRow = readNewestRow<T>(*lastDiff);
+                if (newestRow.has_value()) {
+                    using column = typename T::table_type::column;
+                    constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
+                    const auto newest = std::get<tupleIndex>(newestRow.value());
+                    query = selectNewestQuery<T>(table.name, std::to_string(newest));
+                } else {
+                    // this table has no old output data
+                    query = selectAllQuery<T>(table.name);
                 }
-                using column = typename T::table_type::column;
-                constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
-                const auto newest = std::get<tupleIndex>(newestRow.value());
-                query = selectNewestQuery<T>(table.name, std::to_string(newest));
             } else {
                 query = selectAllQuery<T>(table.name);
             }
@@ -318,15 +349,20 @@ void runBackup(pqxx::connection& db, const fs::path& rootOutput) {
             throw std::logic_error{"unhandled type"};
         }
 
-        pqxx::result result = pqxx::work{db}.exec(query);
+        pqxx::result result = pqxx::work{db}.exec(query); // might want to put this outside of the lambda
         std::cout << result.size() << " rows\n";
 
         outputTable<typename T::tuple>(tableFile, result);
+
+        return result.size();
     };
 
+    int largest = -1;
     std::apply([&](const auto&... table) {
-        (output(table), ...);
+        ((largest = std::max(output(table), largest)), ...);
     }, tables);
+    assert(largest != -1);
+    return largest;
 }
 
 int main(int argc, char** argv)
@@ -338,6 +374,11 @@ int main(int argc, char** argv)
         const fs::path out{"output"};
         fs::create_directories(out);
 
+        // queries are limited to 10 mil rows so just keep going until there are no more rows to query
+        int mostRows;
+        do {
+            mostRows = runBackup(con, out);
+        } while(mostRows >= 10'000'000);
         runBackup(con, out);
         //pqxx::work work{con};
         //pqxx::result result = work.exec("select * from Players limit 1");
