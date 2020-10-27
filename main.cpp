@@ -307,7 +307,7 @@ std::string columnNames() {
 template<typename TABLE> requires is_incremental<typename TABLE::table_type>
 std::string selectNewestQuery(const std::string& table, const std::string& oldValue) {
     std::string columnName{TABLE::table_type::column::name};
-    return "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue + " ORDER BY " + columnName + " DESC ";
+    return "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue + " ORDER BY " + columnName + " ASC";
 }
 
 template<typename TABLE>

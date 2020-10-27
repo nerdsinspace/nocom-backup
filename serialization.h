@@ -53,22 +53,27 @@ struct Serializable<T> {
     static T deserialize(std::ifstream& in) {
         char bytes[sizeof(T)];
         in.read(bytes, sizeof(T));
+        const auto b = [&](size_t i) -> T {
+            return static_cast<T>(bytes[i]) & 0xFF;
+        };
 
-        //if constexpr (sizeof(T) == 1) {
-        //    return static_cast<T>(bytes[0]);
-        //} else if constexpr (sizeof(T) == 2) {
-        //    return bytes[0] << 8 | bytes[1];
-        //} else if constexpr (sizeof(T) == 4) {
-        //    return bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3];
-        //} else if constexpr (sizeof(T) == 8) {
-        //    return bytes[0] << 56 | bytes[1] << 48 | bytes[2] << 40 | bytes[3] << 32 | bytes[4] << 24 | bytes[5] << 16 | bytes[6] << 8 | bytes[7];
-        //}
-
-        auto out =  [&]<size_t... I>(std::index_sequence<I...>) {
-           return (( static_cast<T>(bytes[I]) << (((sizeof(T) - 1) - I) * 8) ) | ...);
-        }(std::make_index_sequence<sizeof(T)>{});
+        T out;
+        if constexpr (sizeof(T) == 1) {
+            out = b(0);
+        } else if constexpr (sizeof(T) == 2) {
+            out =  (b(0) << 8) | b(1);
+        } else if constexpr (sizeof(T) == 4) {
+            out =  (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3);
+        } else if constexpr (sizeof(T) == 8) {
+            out =  (b(0) << 56) | (b(1) << 48) | (b(2) << 40) | (b(3) << 32) | (b(4) << 24) | (b(5) << 16) | (b(6) << 8) | b(7);
+        }
 
         return out;
+        /*auto out =  [&]<size_t... I>(std::index_sequence<I...>) {
+           return (( (static_cast<T>(bytes[I]) & 0xFF) << (((sizeof(T) - 1) - I) * 8) ) | ...);
+        }(std::make_index_sequence<sizeof(T)>{});
+
+        return out;*/
     }
 };
 
