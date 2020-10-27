@@ -27,10 +27,11 @@ enum class UpdateType : char {
 
 struct Header {
     static constexpr int CURRENT_VERSION = 1;
-    int version;
-    int numRows;
+    int32_t version;
+    int32_t numRows;
 
-    explicit Header(int rows): numRows(rows), version(CURRENT_VERSION) {}
+    explicit Header(int v, int rows): version(v), numRows(rows) {}
+    explicit Header(int rows): Header(CURRENT_VERSION, rows) {}
     explicit Header() = default;
 
     void checkVersion() const {
@@ -39,8 +40,21 @@ struct Header {
         }
     }
 };
-static_assert(std::has_unique_object_representations_v<Header>);
 
+template<>
+struct Serializable<Header> {
+    static void serialize(std::pmr::vector<char>& vec, Header h) {
+        Serializable<int32_t>::serialize(vec, h.version);
+        Serializable<int32_t>::serialize(vec, h.numRows);
+    }
+
+    static Header deserialize(std::ifstream& in) {
+        return Header {
+          Serializable<int32_t>::deserialize(in),
+          Serializable<int32_t>::deserialize(in)
+        };
+    }
+};
 
 template<typename>
 constexpr bool is_tuple = false;
@@ -73,10 +87,10 @@ const auto tables = std::make_tuple(
 );
 
 
-std::optional<uint64_t> filenameAsTimestamp(const fs::path& path) {
-    const fs::path name = path.filename().stem(); // strip extension
+std::optional<uint64_t> pathNameAsTimestamp(const fs::path& path) {
+    const fs::path name = path.filename();
     try {
-        return std::stoi(name.native());
+        return std::stoull(name.string());
     } catch (...) {
         return {};
     }
@@ -85,12 +99,12 @@ std::optional<uint64_t> filenameAsTimestamp(const fs::path& path) {
 std::vector<fs::path> getOldOutputsSorted(const fs::path& dir) {
     std::vector<fs::path> paths;
     for (auto& p : fs::directory_iterator{dir}) {
-        if (filenameAsTimestamp(p).has_value()) {
+        if (pathNameAsTimestamp(p).has_value()) {
             paths.push_back(p);
         }
     }
     const auto cmp = [](const fs::path& a, const fs::path& b) {
-        return filenameAsTimestamp(a).value() < filenameAsTimestamp(b).value();
+        return pathNameAsTimestamp(a).value() > pathNameAsTimestamp(b).value();
     };
     std::ranges::sort(paths, cmp);
     return paths;
@@ -106,27 +120,27 @@ std::optional<fs::path> getNewestOutput(const fs::path& dir) {
 }
 
 Header readHeader(const fs::path& file) {
+    auto troll = file.string();
     std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
     in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
-    Header h{};
-    in.read(reinterpret_cast<char*>(&h), sizeof(h));
-    return h;
+    return Serializable<Header>::deserialize(in);
 }
 
-std::optional<fs::path> getNewestNonEmptyDiffForTable(const fs::path& dir, std::string_view tableName) {
-    const std::vector<fs::path> paths = getOldOutputsSorted(dir);
+std::optional<fs::path> getNewestNonEmptyDiffForTable(const fs::path& root, std::string_view tableName) {
+    const std::vector<fs::path> paths = getOldOutputsSorted(root);
     for (const auto& p : paths) {
-        const auto tableFile = dir / tableName;
-        if (!fs::exists(p)) {
-            std::cerr << "Warning: old output (" << p.string() << ") does not contain file for " << tableName << '\n';
+        const auto tableFile = p / tableName;
+        if (!fs::exists(tableFile)) {
+            std::cout << "Warning: old output (" << p.string() << ") does not contain file for " << tableName << '\n';
         } else {
-            const Header h = readHeader(p);
+            const Header h = readHeader(tableFile);
             if (h.version != Header::CURRENT_VERSION) {
+                std::cerr << "wrong version number\n";
                 // TODO: handle this better?
                 break;
             }
             if (h.numRows > 0) {
-                return p;
+                return tableFile;
             }
         }
     }
@@ -179,8 +193,9 @@ void serializeTupleToBuffer(const Tuple& tuple, std::pmr::vector<char>& vec) {
 }
 
 void writeHeader(std::ofstream& out, int rows) {
-    const Header h{rows};
-    out.write(reinterpret_cast<const char*>(&h), sizeof(h));
+    std::pmr::vector<char> buf;
+    Serializable<Header>::serialize(buf, Header{rows});
+    out.write(buf.data(), buf.size());
 }
 
 void writeHeader(const fs::path& file, int rows) {
@@ -257,10 +272,11 @@ std::optional<typename TABLE::tuple> readNewestRow(const fs::path& file) {
     std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
     in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
-    Header header{};
-    in.read(reinterpret_cast<char*>(&header), sizeof(header));
-    header.checkVersion();
-    if (header.numRows > 0) {
+    const Header h = Serializable<Header>::deserialize(in);
+    h.checkVersion();
+    UpdateType type = Serializable<UpdateType>::deserialize(in); // TODO: use this
+    auto cursor = in.tellg();
+    if (h.numRows > 0) {
         return readTuple<typename TABLE::tuple>(in);
     } else {
         // This should never happen for a table like hits but dimensions will almost always be empty after the first diff
@@ -291,17 +307,7 @@ std::string columnNames() {
 template<typename TABLE> requires is_incremental<typename TABLE::table_type>
 std::string selectNewestQuery(const std::string& table, const std::string& oldValue) {
     std::string columnName{TABLE::table_type::column::name};
-    return "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue;
-}
-
-std::string sortedResults(const std::string& query, const std::string& column) {
-    return "SELECT * FROM (" + query + ") AS UWU ORDER BY " + column + " DESC";
-}
-
-template<typename TABLE> requires is_incremental<typename TABLE::table_type>
-std::string sortedResults(const std::string& query) {
-    std::string columnName{TABLE::table_type::column::name};
-    return sortedResults(query, columnName);
+    return "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue + " ORDER BY " + columnName + " DESC ";
 }
 
 template<typename TABLE>
@@ -314,12 +320,13 @@ int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
     const auto now = std::chrono::system_clock::now();
     const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     const fs::path outDir = rootOutput / std::to_string(millis);
-    //const std::optional<fs::path> lastDiff = getNewestOutput(rootOutput);
 
     std::cout << "Creating output directory at " << outDir << '\n';
     fs::create_directory(outDir);
 
     const auto output = [&]<typename T>(const T& table) -> int {
+        if (table.name != "chat") return 0;
+
         const fs::path tableFile = outDir / table.name;
 
         std::string query;
@@ -331,6 +338,11 @@ int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
                     using column = typename T::table_type::column;
                     constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
                     const auto newest = std::get<tupleIndex>(newestRow.value());
+                    const auto reee = std::get<0>(newestRow.value());
+                    size_t size{};
+                    if constexpr (std::is_same_v<std::string, std::tuple_element_t<0, typename T::tuple>>) {
+                        size = std::get<0>(*newestRow).size();
+                    }
                     query = selectNewestQuery<T>(table.name, std::to_string(newest));
                 } else {
                     // this table has no old output data
@@ -340,11 +352,10 @@ int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
                 query = selectAllQuery<T>(table.name);
             }
 
-            query += " limit 10000000";
-            query = sortedResults<T>(query);
+            query += " limit 1";
         } else if constexpr (std::is_same_v<typename T::table_type, Rewrite>) {
             query = selectAllQuery<T>(table.name);
-            query += " limit 10000000";
+            query += " limit 1";
         } else {
             throw std::logic_error{"unhandled type"};
         }
@@ -374,12 +385,19 @@ int main(int argc, char** argv)
         const fs::path out{"output"};
         fs::create_directories(out);
 
+        auto t0 = std::chrono::system_clock::now();
+
         // queries are limited to 10 mil rows so just keep going until there are no more rows to query
         int mostRows;
         do {
             mostRows = runBackup(con, out);
-        } while(mostRows >= 10'000'000);
-        runBackup(con, out);
+        } while(mostRows >= 1/*10'000'000*/);
+
+        auto t1 = std::chrono::system_clock::now();
+
+        auto time = std::chrono::duration_cast<std::chrono::seconds>(t1 - t0).count();
+        std::cout << "Backup took " << time << " to run\n";
+
         //pqxx::work work{con};
         //pqxx::result result = work.exec("select * from Players limit 1");
         //for (auto row: result)
