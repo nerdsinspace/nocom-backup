@@ -101,8 +101,11 @@ std::vector<fs::path> getOldOutputsSorted(const fs::path& dir) {
     for (auto& p : fs::directory_iterator{dir}) {
         if (pathNameAsTimestamp(p).has_value()) {
             paths.push_back(p);
+        } else {
+            std::cout << "troll\n";
         }
     }
+    auto str = dir.string();
     const auto cmp = [](const fs::path& a, const fs::path& b) {
         return pathNameAsTimestamp(a).value() > pathNameAsTimestamp(b).value();
     };
@@ -307,7 +310,8 @@ std::string columnNames() {
 template<typename TABLE> requires is_incremental<typename TABLE::table_type>
 std::string selectNewestQuery(const std::string& table, const std::string& oldValue) {
     std::string columnName{TABLE::table_type::column::name};
-    return "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue + " ORDER BY " + columnName + " ASC";
+    auto ascending =  "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue + " ORDER BY " + columnName + " ASC";
+    return "SELECT * FROM (" + ascending + ") as UWU ORDER BY " + columnName + " DESC";
 }
 
 template<typename TABLE>
@@ -325,7 +329,7 @@ int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
     fs::create_directory(outDir);
 
     const auto output = [&]<typename T>(const T& table) -> int {
-        if (table.name != "chat") return 0;
+        //if (table.name != "chat") return 0;
 
         const fs::path tableFile = outDir / table.name;
 
@@ -352,10 +356,10 @@ int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
                 query = selectAllQuery<T>(table.name);
             }
 
-            query += " limit 1";
+            query += " limit 10000000";
         } else if constexpr (std::is_same_v<typename T::table_type, Rewrite>) {
             query = selectAllQuery<T>(table.name);
-            query += " limit 1";
+            query += " limit 10000000";
         } else {
             throw std::logic_error{"unhandled type"};
         }
@@ -391,7 +395,7 @@ int main(int argc, char** argv)
         int mostRows;
         do {
             mostRows = runBackup(con, out);
-        } while(mostRows >= 1/*10'000'000*/);
+        } while(mostRows >= 10'000'000);
 
         auto t1 = std::chrono::system_clock::now();
 
