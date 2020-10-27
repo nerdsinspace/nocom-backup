@@ -308,10 +308,15 @@ std::string columnNames() {
 }
 
 template<typename TABLE> requires is_incremental<typename TABLE::table_type>
-std::string selectNewestQuery(const std::string& table, const std::string& oldValue) {
+std::string selectIncrementalQuery(const std::string& table, const std::optional<std::string>& oldValue, int64_t limit) {
     std::string columnName{TABLE::table_type::column::name};
-    auto ascending =  "SELECT " + columnNames<TABLE>()  + " FROM " + table + " WHERE " + columnName + " > " + oldValue + " ORDER BY " + columnName + " ASC";
-    return "SELECT * FROM (" + ascending + ") as UWU ORDER BY " + columnName + " DESC";
+    std::stringstream ss;
+    ss << "SELECT " << columnNames<TABLE>()  << " FROM " << table;
+    if (oldValue) {
+        ss << " WHERE " << columnName << " > " << *oldValue;
+    }
+    ss << " ORDER BY " << columnName << " ASC";
+    return "SELECT * FROM (" + ss.str() + " LIMIT " + std::to_string(limit) + ") as UWU ORDER BY " + columnName + " DESC";
 }
 
 template<typename TABLE>
@@ -320,13 +325,14 @@ std::string selectAllQuery(const std::string& table) {
 }
 
 // returns the largest number of rows returned by a query
-int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
+int runBackup(pqxx::work& transaction, const fs::path& rootOutput) {
     const auto now = std::chrono::system_clock::now();
     const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     const fs::path outDir = rootOutput / std::to_string(millis);
 
     std::cout << "Creating output directory at " << outDir << '\n';
     fs::create_directory(outDir);
+    constexpr int64_t LIMIT = 10'000'000;
 
     const auto output = [&]<typename T>(const T& table) -> int {
         //if (table.name != "chat") return 0;
@@ -342,29 +348,28 @@ int runBackup(pqxx::connection& db, const fs::path& rootOutput) {
                     using column = typename T::table_type::column;
                     constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
                     const auto newest = std::get<tupleIndex>(newestRow.value());
-                    const auto reee = std::get<0>(newestRow.value());
-                    size_t size{};
-                    if constexpr (std::is_same_v<std::string, std::tuple_element_t<0, typename T::tuple>>) {
-                        size = std::get<0>(*newestRow).size();
-                    }
-                    query = selectNewestQuery<T>(table.name, std::to_string(newest));
+                    //const auto reee = std::get<0>(newestRow.value());
+                    //size_t size{};
+                    //if constexpr (std::is_same_v<std::string, std::tuple_element_t<0, typename T::tuple>>) {
+                    //    size = std::get<0>(*newestRow).size();
+                    //}
+                    query = selectIncrementalQuery<T>(table.name, std::to_string(newest), LIMIT);
                 } else {
                     // this table has no old output data
-                    query = selectAllQuery<T>(table.name);
+                    query = selectIncrementalQuery<T>(table.name, std::nullopt, LIMIT);
                 }
             } else {
-                query = selectAllQuery<T>(table.name);
+                query = selectIncrementalQuery<T>(table.name, std::nullopt, LIMIT);
             }
-
-            query += " limit 10000000";
+            //query += " limit 10000000";
         } else if constexpr (std::is_same_v<typename T::table_type, Rewrite>) {
             query = selectAllQuery<T>(table.name);
-            query += " limit 10000000";
         } else {
             throw std::logic_error{"unhandled type"};
         }
 
-        pqxx::result result = pqxx::work{db}.exec(query); // might want to put this outside of the lambda
+        std::cout << query << '\n';
+        pqxx::result result = transaction.exec(query); // might want to put this outside of the lambda
         std::cout << result.size() << " rows\n";
 
         outputTable<typename T::tuple>(tableFile, result);
@@ -391,16 +396,17 @@ int main(int argc, char** argv)
 
         auto t0 = std::chrono::system_clock::now();
 
+        pqxx::work transaction{con};
         // queries are limited to 10 mil rows so just keep going until there are no more rows to query
         int mostRows;
         do {
-            mostRows = runBackup(con, out);
+            mostRows = runBackup(transaction, out);
         } while(mostRows >= 10'000'000);
 
         auto t1 = std::chrono::system_clock::now();
 
         auto time = std::chrono::duration_cast<std::chrono::seconds>(t1 - t0).count();
-        std::cout << "Backup took " << time << " to run\n";
+        std::cout << "Backup took " << time << " seconds to run\n";
 
         //pqxx::work work{con};
         //pqxx::result result = work.exec("select * from Players limit 1");
