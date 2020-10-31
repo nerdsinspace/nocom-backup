@@ -93,6 +93,7 @@ template<>
 struct Serializable<UUID> {
     static void serialize(std::pmr::vector<char>& vec, const UUID& x) {
         auto* buf = allocateElements(vec, sizeof(x.bytes));
+        memcpy(buf, x.bytes, sizeof(x.bytes));
     }
 
     static UUID deserialize(std::ifstream& in) {
