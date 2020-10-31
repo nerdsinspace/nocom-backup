@@ -7,6 +7,9 @@
 #include <chrono>
 #include <memory_resource>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <ranges>
 
 #include <pqxx/pqxx>
 #include <args.hxx>
@@ -19,6 +22,7 @@
 namespace fs = std::filesystem;
 using namespace std::literals;
 
+constexpr auto QUERY_LIMIT = 10'000'000;
 
 enum class UpdateType : char {
     Create,
@@ -29,6 +33,7 @@ struct Header {
     static constexpr int CURRENT_VERSION = 1;
     int32_t version;
     int32_t numRows;
+    int64_t lastRowPos = -1; // byte position in the file of the last row
 
     explicit Header(int v, int rows): version(v), numRows(rows) {}
     explicit Header(int rows): Header(CURRENT_VERSION, rows) {}
@@ -66,10 +71,6 @@ constexpr bool is_optional = false;
 template<typename T>
 constexpr bool is_optional<std::optional<T>> = true;
 
-template<typename>
-constexpr bool is_incremental = false;
-template<typename T>
-constexpr bool is_incremental<Incremental<T>> = true;
 
 // TODO: make table names constexpr
 const auto tables = std::make_tuple(
@@ -134,7 +135,8 @@ std::optional<fs::path> getNewestNonEmptyDiffForTable(const fs::path& root, std:
     for (const auto& p : paths) {
         const auto tableFile = p / tableName;
         if (!fs::exists(tableFile)) {
-            std::cout << "Warning: old output (" << p.string() << ") does not contain file for " << tableName << '\n';
+            // this is now expected to happen
+            //std::cout << "Warning: old output (" << p.string() << ") does not contain file for " << tableName << '\n';
         } else {
             const Header h = readHeader(tableFile);
             if (h.version != Header::CURRENT_VERSION) {
@@ -278,7 +280,6 @@ std::optional<typename TABLE::tuple> readNewestRow(const fs::path& file) {
     const Header h = Serializable<Header>::deserialize(in);
     h.checkVersion();
     UpdateType type = Serializable<UpdateType>::deserialize(in); // TODO: use this
-    auto cursor = in.tellg();
     if (h.numRows > 0) {
         return readTuple<typename TABLE::tuple>(in);
     } else {
@@ -307,7 +308,7 @@ std::string columnNames() {
     return ColumnNamesImpl<typename TABLE::base_type>::get();
 }
 
-template<typename TABLE> requires is_incremental<typename TABLE::table_type>
+template<IncrementalTable TABLE>
 std::string selectIncrementalQuery(const std::string& table, const std::optional<std::string>& oldValue, int64_t limit) {
     std::string columnName{TABLE::table_type::column::name};
     std::stringstream ss;
@@ -319,28 +320,25 @@ std::string selectIncrementalQuery(const std::string& table, const std::optional
     return "SELECT * FROM (" + ss.str() + " LIMIT " + std::to_string(limit) + ") as UWU ORDER BY " + columnName + " DESC";
 }
 
-template<typename TABLE>
+template<RewriteTable TABLE>
 std::string selectAllQuery(const std::string& table) {
-    return "SELECT "s + columnNames<TABLE>() + " FROM "s + table;
+    return "SELECT " + columnNames<TABLE>() + " FROM " + table;
 }
 
 // returns the largest number of rows returned by a query
-int runBackup(pqxx::work& transaction, const fs::path& rootOutput) {
+std::unordered_map<std::string, int> runBackup(pqxx::work& transaction, const fs::path& rootOutput, const std::unordered_set<std::string>& tableFilter) {
     const auto now = std::chrono::system_clock::now();
     const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     const fs::path outDir = rootOutput / std::to_string(millis);
 
     std::cout << "Creating output directory at " << outDir << '\n';
     fs::create_directory(outDir);
-    constexpr int64_t LIMIT = 10'000'000;
 
     const auto output = [&]<typename T>(const T& table) -> int {
-        //if (table.name != "chat") return 0;
-
         const fs::path tableFile = outDir / table.name;
 
         std::string query;
-        if constexpr (is_incremental<typename T::table_type>) {
+        if constexpr (IncrementalTable<T>) {
             const std::optional<fs::path> lastDiff = getNewestNonEmptyDiffForTable(rootOutput, table.name);
             if (lastDiff.has_value()) {
                 const std::optional newestRow = readNewestRow<T>(*lastDiff);
@@ -353,16 +351,15 @@ int runBackup(pqxx::work& transaction, const fs::path& rootOutput) {
                     //if constexpr (std::is_same_v<std::string, std::tuple_element_t<0, typename T::tuple>>) {
                     //    size = std::get<0>(*newestRow).size();
                     //}
-                    query = selectIncrementalQuery<T>(table.name, std::to_string(newest), LIMIT);
+                    query = selectIncrementalQuery<T>(table.name, std::to_string(newest), QUERY_LIMIT);
                 } else {
                     // this table has no old output data
-                    query = selectIncrementalQuery<T>(table.name, std::nullopt, LIMIT);
+                    query = selectIncrementalQuery<T>(table.name, std::nullopt, QUERY_LIMIT);
                 }
             } else {
-                query = selectIncrementalQuery<T>(table.name, std::nullopt, LIMIT);
+                query = selectIncrementalQuery<T>(table.name, std::nullopt, QUERY_LIMIT);
             }
-            //query += " limit 10000000";
-        } else if constexpr (std::is_same_v<typename T::table_type, Rewrite>) {
+        } else if constexpr (RewriteTable<T>) {
             query = selectAllQuery<T>(table.name);
         } else {
             throw std::logic_error{"unhandled type"};
@@ -377,12 +374,28 @@ int runBackup(pqxx::work& transaction, const fs::path& rootOutput) {
         return result.size();
     };
 
-    int largest = -1;
-    std::apply([&](const auto&... table) {
-        ((largest = std::max(output(table), largest)), ...);
+    std::unordered_map<std::string, int> out;
+    std::apply([&]<typename... T>(const T&... table) {
+        ([&] {
+            if (tableFilter.contains(table.name)) return;
+            const int rows = output(table);
+            out.emplace(table.name, rows);
+        }(), ...);
     }, tables);
-    assert(largest != -1);
-    return largest;
+
+    return out;
+}
+
+std::unordered_set<std::string> rewriteTables() {
+    return std::apply([]<typename... T>(const T&... table) {
+        std::unordered_set<std::string> out;
+        ([&] {
+            if constexpr (RewriteTable<T>) {
+                out.emplace(table.name);
+            }
+        }(), ...);
+        return out;
+    }, tables);
 }
 
 int main(int argc, char** argv)
@@ -397,11 +410,35 @@ int main(int argc, char** argv)
         auto t0 = std::chrono::system_clock::now();
 
         pqxx::work transaction{con};
+
+        const auto maxValue = [](const auto& map) {
+            auto it =  std::ranges::max_element(map, {}, [](const auto& iter) { return iter.second; });
+            if (it == map.end()) throw std::runtime_error{"empty map"};
+            return it->second;
+        };
+
+        // returns a set of table names that had under 10 mil rows returned from query
+        const auto resultsUnderLimit = [](const std::unordered_map<std::string, int>& rowCounts) {
+            std::unordered_set<std::string> out;
+            for (const auto& it : rowCounts) {
+                if (it.second < QUERY_LIMIT) {
+                    out.emplace(it.first);
+                }
+            }
+            return out;
+        };
+
         // queries are limited to 10 mil rows so just keep going until there are no more rows to query
-        int mostRows;
-        do {
-            mostRows = runBackup(transaction, out);
-        } while(mostRows >= 10'000'000);
+        std::unordered_map<std::string, int> rowCounts = runBackup(transaction, out, {});
+        std::unordered_set tableFilter = rewriteTables();
+        tableFilter.merge(resultsUnderLimit(rowCounts));
+
+        // the rowCounts being empty shouldn't be possible
+        while (!rowCounts.empty() && maxValue(rowCounts) >= QUERY_LIMIT) {
+            rowCounts = runBackup(transaction, out, tableFilter);
+
+           tableFilter.merge(resultsUnderLimit(rowCounts));
+        }
 
         auto t1 = std::chrono::system_clock::now();
 

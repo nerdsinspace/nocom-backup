@@ -167,12 +167,14 @@ struct Serializable<pqxx::binarystring> {
     static pqxx::binarystring deserialize(std::ifstream& in) {
         const auto len = Serializable<int32_t>::deserialize(in);
         using buf_type = pqxx::binarystring::value_type;
+        static_assert(sizeof(buf_type) == 1);
         using size_type = pqxx::binarystring::size_type;
-        auto* buf = new buf_type[len];
+        // pqxx uses malloc/free
+        auto* buf = (buf_type*)malloc(len);
         in.read(reinterpret_cast<char*>(buf), len);
 
         // binarystring uses shared_ptr
-        auto shared = std::shared_ptr<buf_type>{buf};
+        auto shared = std::shared_ptr<buf_type>{buf, std::free};
         return pqxx::binarystring{std::move(shared), static_cast<size_type>(len)};
     }
 };

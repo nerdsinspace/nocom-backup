@@ -14,6 +14,17 @@ struct Incremental {
 
 struct Rewrite {};
 
+template<typename T>
+concept RewriteTable = std::is_same_v<typename T::table_type, Rewrite>;
+
+template<typename>
+constexpr bool is_incremental = false;
+template<typename T>
+constexpr bool is_incremental<Incremental<T>> = true;
+
+template<typename T>
+concept IncrementalTable = is_incremental<typename T::table_type>;
+
 template<typename... Columns> // TODO: make sure there are no duplicate types
 struct Table {
     using tuple = std::tuple<typename Columns::type...>;
@@ -33,9 +44,9 @@ struct Id : Column<T> {
     static constexpr std::string_view name = "id";
 };
 
+using Id16 = Id<int16_t>;
 using Id32 = Id<int32_t>;
 using Id64 = Id<int64_t>;
-using Id16 = Id<int16_t>;
 
 struct X : Column<int32_t> {
     static constexpr std::string_view name = "x";
