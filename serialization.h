@@ -16,6 +16,16 @@ T* allocateElements(std::pmr::vector<T>& vec, size_t size) {
     return &vec.back() - (size - 1);
 }
 
+template<typename T> requires std::is_integral_v<T>
+constexpr auto toCharArray(T x) -> std::array<char, sizeof(T)> {
+    std::array<char, sizeof(T)> buf{};
+
+    [&]<size_t... I>(std::index_sequence<I...>) {
+        ((buf[I] = (x >> (((sizeof(T) - 1) - I) * 8)) & 0xFF), ...);
+    }(std::make_index_sequence<sizeof(T)>{});
+
+    return buf;
+}
 
 template<typename T> requires std::is_floating_point_v<T>
 struct Serializable<T> {
@@ -45,9 +55,8 @@ struct Serializable<T> {
         } else if constexpr (sizeof(T) == 8) {
 
         }*/
-        [&]<size_t... I>(std::index_sequence<I...>) {
-            ((buf[I] = (x >> (((sizeof(T) - 1) - I) * 8)) & 0xFF), ...);
-        }(std::make_index_sequence<sizeof(T)>{});
+        std::array chars = toCharArray(x);
+        memcpy(buf, chars.data(), sizeof(T));
     }
 
     static T deserialize(std::ifstream& in) {
@@ -116,7 +125,6 @@ struct Serializable<std::string_view> {
     // this does not return string_view
     static std::string deserialize(std::ifstream& in) {
         const auto len = Serializable<int32_t>::deserialize(in);
-        auto cursor = in.tellg();
         std::string out;
         out.resize(len);
         in.read(out.data(), len);

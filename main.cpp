@@ -44,6 +44,10 @@ struct Header {
             throw std::runtime_error{"File has different version"};
         }
     }
+
+    static int64_t lastRowPosOffset() {
+        return sizeof(version) + sizeof(numRows);
+    }
 };
 
 template<>
@@ -203,12 +207,6 @@ void writeHeader(std::ofstream& out, int rows) {
     out.write(buf.data(), buf.size());
 }
 
-void writeHeader(const fs::path& file, int rows) {
-    std::ofstream out(file, std::ios_base::out | std::ios_base::binary);
-    out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
-    writeHeader(out, rows);
-}
-
 template<typename Tuple> requires is_tuple<Tuple>
 void outputTable(const fs::path& file, const pqxx::result& result) {
     std::cout << "Outputting table to " << file.string() << '\n';
@@ -217,6 +215,7 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
 
     writeHeader(out, result.size());
 
+    int64_t lastRowPosition = 0;
     for (const pqxx::row& row : result) {
         const auto tuple = rowToTuple<Tuple>(row);
         char allocator_buffer[1000000]; // should be more than enough for any row
@@ -228,8 +227,15 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
         // I can potentially remove this for incremental tables
         Serializable<UpdateType>::serialize(buffer, UpdateType::Create);
         serializeTupleToBuffer(tuple, buffer);
-        out.write(&buffer[0], buffer.size());
+
+        lastRowPosition = out.tellp();
+        out.write(buffer.data(), buffer.size());
     }
+
+    out.seekp(Header::lastRowPosOffset());
+    const std::array chars = toCharArray(lastRowPosition);
+    out.write(chars.data(), chars.size());
+    // cursor no longer points to the end of the file
 }
 
 template<typename T, typename... Rest>
@@ -444,11 +450,6 @@ int main(int argc, char** argv)
 
         auto time = std::chrono::duration_cast<std::chrono::seconds>(t1 - t0).count();
         std::cout << "Backup took " << time << " seconds to run\n";
-
-        //pqxx::work work{con};
-        //pqxx::result result = work.exec("select * from Players limit 1");
-        //for (auto row: result)
-        //    std::cout << row[1].c_str() << '\n';
 
         std::cout << "Done.\n";
     }
