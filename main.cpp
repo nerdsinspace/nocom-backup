@@ -22,20 +22,22 @@
 namespace fs = std::filesystem;
 using namespace std::literals;
 
-constexpr auto QUERY_LIMIT = 10'000'000;
-
-enum class UpdateType : char {
-    Create,
-    Delete
-};
+constexpr auto QUERY_LIMIT = 10'000;//10'000'000;
 
 struct Header {
     static constexpr int CURRENT_VERSION = 1;
     int32_t version = CURRENT_VERSION;
-    int32_t numRows;
+    int32_t numRows{};
     int64_t lastRowPos = -1; // byte position in the file of the last row
+    // This will need to be changed if a table with a non number key is added.
+    // These have meaningless values for rewrite tables.
+    int64_t firstRowKey = -666; // yesterday_first_row
+    int64_t lastRowKey = -666; // yesterday_last_row
 
-    explicit Header(int v, int rows, int64_t lastRow): version(v), numRows(rows), lastRowPos(lastRow) {}
+    explicit Header(int v, int rows, int64_t lastRow):
+        version(v), numRows(rows), lastRowPos(lastRow) {}
+    explicit Header(int v, int rows, int64_t lastRow, int64_t firstKey, int64_t lastKey):
+        version(v), numRows(rows), lastRowPos(lastRow), firstRowKey(firstKey), lastRowKey(lastKey) {}
     explicit Header(int rows): numRows(rows) {}
     explicit Header() = default;
 
@@ -56,13 +58,17 @@ struct Serializable<Header> {
         Serializable<int32_t>::serialize(vec, h.version);
         Serializable<int32_t>::serialize(vec, h.numRows);
         Serializable<int64_t>::serialize(vec, h.lastRowPos);
+        Serializable<int64_t>::serialize(vec, h.firstRowKey);
+        Serializable<int64_t>::serialize(vec, h.lastRowKey);
     }
 
     static Header deserialize(std::ifstream& in) {
         return Header {
-          Serializable<int32_t>::deserialize(in),
-          Serializable<int32_t>::deserialize(in),
-          Serializable<int64_t>::deserialize(in)
+          Serializable<int32_t>::deserialize(in), // version
+          Serializable<int32_t>::deserialize(in), // numRows
+          Serializable<int64_t>::deserialize(in), // lastRowPos
+          Serializable<int64_t>::deserialize(in), // firstRowKey
+          Serializable<int64_t>::deserialize(in)  // lastRowKey
         };
     }
 };
@@ -82,11 +88,11 @@ constexpr bool is_optional<std::optional<T>> = true;
 const auto tables = std::make_tuple(
     Dimensions    {"dimensions"},
     LastByServer  {"last_by_server"},
-    PlayerSessions{"player_sessions"},
+    //PlayerSessions{"player_sessions"},
     Players       {"players"},
     Servers       {"servers"},
     Signs         {"signs"},
-    Tracks        {"tracks"},
+    //Tracks        {"tracks"},
     Chat          {"chat"},
     Hits          {"hits"},
     Blocks        {"blocks"}
@@ -122,8 +128,8 @@ std::vector<fs::path> getOldOutputsSorted(const fs::path& dir) {
 // Today's output has already been created so we want to be able to ignore it
 std::optional<fs::path> getNewestOutput(const fs::path& dir, const fs::path& today) {
     std::vector<fs::path> paths = getOldOutputsSorted(dir);
-    auto it = std::find_if_not(paths.rbegin(), paths.rend(), [&](const fs::path& p) { return p == today; });
-    if (it != paths.rend()) {
+    auto it = std::find_if_not(paths.begin(), paths.end(), [&](const fs::path& p) { return p == today; });
+    if (it != paths.end()) {
         return std::move(*it);
     } else {
         return {};
@@ -205,13 +211,24 @@ void writeHeader(std::ofstream& out, int rows) {
     out.write(buf.data(), buf.size());
 }
 
+void writeHeader(std::ofstream& out, int rows, int64_t firstRowKey, int64_t lastRowKey) {
+    std::pmr::vector<char> buf;
+    Serializable<Header>::serialize(buf, Header{Header::CURRENT_VERSION, rows, -1, firstRowKey, lastRowKey});
+    out.write(buf.data(), buf.size());
+}
+
 template<typename Tuple> requires is_tuple<Tuple>
-void outputTable(const fs::path& file, const pqxx::result& result) {
+void outputTable(const fs::path& file, const pqxx::result& result, std::optional<std::pair<int64_t, int64_t>> firstLast) {
     std::cout << "Outputting table to " << file.string() << '\n';
     std::ofstream out(file, std::ios_base::out | std::ios_base::binary);
     out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
-    writeHeader(out, result.size());
+    if (firstLast) {
+        writeHeader(out, result.size(), firstLast->first, firstLast->second);
+    } else {
+        writeHeader(out, result.size(), -1, -1);
+    }
+
 
     int64_t lastRowPosition = 0;
     for (const pqxx::row& row : result) {
@@ -222,8 +239,6 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
         std::pmr::vector<char> buffer{&resource};
         buffer.reserve(sizeof(allocator_buffer));
 
-        // I can potentially remove this for incremental tables
-        Serializable<UpdateType>::serialize(buffer, UpdateType::Create);
         serializeTupleToBuffer(tuple, buffer);
 
         lastRowPosition = out.tellp();
@@ -283,8 +298,9 @@ std::optional<typename TABLE::tuple> readNewestRow(const fs::path& file) {
 
     const Header h = Serializable<Header>::deserialize(in);
     h.checkVersion();
-    UpdateType type = Serializable<UpdateType>::deserialize(in); // TODO: use this
     if (h.numRows > 0) {
+        if (h.lastRowPos < 0) throw "trolled";
+        in.seekg(h.lastRowPos);
         return readTuple<typename TABLE::tuple>(in);
     } else {
         // This should never happen for a table like hits but dimensions will almost always be empty after the first diff
@@ -313,15 +329,29 @@ std::string columnNames() {
 }
 
 template<IncrementalTable TABLE>
-std::string selectIncrementalQuery(const std::string& table, const std::optional<std::string>& oldValue, int64_t limit) {
+std::string incrementalGetNewestRowsQuery(const std::string& table, const std::optional<std::string>& oldValue, int64_t limit) {
     std::string columnName{TABLE::table_type::column::name};
     std::stringstream ss;
     ss << "SELECT " << columnNames<TABLE>()  << " FROM " << table;
     if (oldValue) {
         ss << " WHERE " << columnName << " > " << *oldValue;
     }
-    ss << " ORDER BY " << columnName << " ASC";
-    return "SELECT * FROM (" + ss.str() + " LIMIT " + std::to_string(limit) + ") as UWU ORDER BY " + columnName + " DESC";
+    ss << " ORDER BY " << columnName << " ASC LIMIT " << std::to_string(limit);
+
+    return ss.str();
+}
+
+// Query rows WHERE the_column >= $yesterday_first_row AND the_column <= $yesterday_last_row
+template<IncrementalTable TABLE>
+std::string incrementalSelectYesterdayQuery(const std::string& table, const std::string& first, const std::string& last) {
+    std::string columnName{TABLE::table_type::column::name};
+    std::stringstream ss;
+    ss
+    << "SELECT " << columnNames<TABLE>()  << " FROM " << table
+    << " WHERE " << columnName << " >= " << first << " AND " << columnName << " <= " << last
+    << " ORDER BY " << columnName << " ASC";
+
+    return ss.str();
 }
 
 template<RewriteTable TABLE>
@@ -329,7 +359,7 @@ std::string selectAllQuery(const std::string& table) {
     return "SELECT " + columnNames<TABLE>() + " FROM " + table;
 }
 
-void runBackup(pqxx::work& transaction, const fs::path& outDir, const fs::path& rootOutput) {
+void backupToday(pqxx::work& transaction, const fs::path& outDir, const fs::path& rootOutput) {
 
     const auto output = [&]<typename T>(const T& table, const fs::path& file, const std::optional<fs::path>& lastDiff) -> int {
         std::string query;
@@ -341,13 +371,13 @@ void runBackup(pqxx::work& transaction, const fs::path& outDir, const fs::path& 
                     constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
                     const auto newest = std::get<tupleIndex>(newestRow.value());
 
-                    query = selectIncrementalQuery<T>(table.name, std::to_string(newest), QUERY_LIMIT);
+                    query = incrementalGetNewestRowsQuery<T>(table.name, std::to_string(newest), QUERY_LIMIT);
                 } else {
                     // this table has no old output data
-                    query = selectIncrementalQuery<T>(table.name, std::nullopt, QUERY_LIMIT);
+                    query = incrementalGetNewestRowsQuery<T>(table.name, std::nullopt, QUERY_LIMIT);
                 }
             } else {
-                query = selectIncrementalQuery<T>(table.name, std::nullopt, QUERY_LIMIT);
+                query = incrementalGetNewestRowsQuery<T>(table.name, std::nullopt, QUERY_LIMIT);
             }
         } else if constexpr (RewriteTable<T>) {
             query = selectAllQuery<T>(table.name);
@@ -358,23 +388,36 @@ void runBackup(pqxx::work& transaction, const fs::path& outDir, const fs::path& 
         std::cout << query << '\n';
         pqxx::result result = transaction.exec(query); // might want to put this outside of the lambda
         std::cout << result.size() << " rows\n";
+        if (result.empty()) return 0;
 
-        outputTable<typename T::tuple>(file, result);
+        if constexpr (IncrementalTable<T>) {
+            // TODO: move this code into outputTuple
+            const std::tuple firstTuple = rowToTuple<typename T::tuple>(result.front());
+            const std::tuple lastTuple  = rowToTuple<typename T::tuple>(result.back()); // TODO: check if 1 row was returned
+            using column = typename T::table_type::column;
+            constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
+            const auto first = std::get<tupleIndex>(firstTuple);
+            const auto last = std::get<tupleIndex>(lastTuple);
+
+            outputTable<typename T::tuple>(file, result, {{first, last}});
+        } else {
+            outputTable<typename T::tuple>(file, result, std::nullopt);
+        }
 
         return result.size();
     };
 
 
+    const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, outDir);
     std::apply([&]<typename... T>(const T&... table) {
         ([&] {
-            const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, outDir);
             const std::optional<fs::path> lastDiff = yesterday.has_value() ? getNewestFileForTable(yesterday.value(), table.name) : std::nullopt;
 
             const fs::path firstFile = outDir / table.name;
             int rows = output(table, firstFile, lastDiff);
-            int n = 1;
-            fs::path lastFile = firstFile;
-            if constexpr (IncrementalTable<T>) {
+            if constexpr (IncrementalTable<T> && false) {
+                int n = 1;
+                fs::path lastFile = firstFile;
                 while (rows >= QUERY_LIMIT) {
                     const fs::path file = outDir / (table.name + std::to_string(n));
                     rows = output(table, file, lastFile);
@@ -384,6 +427,77 @@ void runBackup(pqxx::work& transaction, const fs::path& outDir, const fs::path& 
             }
         }(), ...);
     }, tables);
+}
+
+// represents all or part of a table's data in memory
+template<typename TABLE>
+struct FullTable {
+    Header header;
+    std::vector<typename TABLE::tuple> rows;
+
+    static FullTable readFromFile(const fs::path& file) {
+        std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
+        in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
+
+        decltype(rows) rowVector;
+        const Header h = Serializable<Header>::deserialize(in);
+        h.checkVersion();
+        for (int i = 0; i < h.numRows; i++) {
+            auto tuple = readTuple<typename TABLE::tuple>(in);
+            rowVector.push_back(std::move(tuple));
+        }
+
+        return FullTable<TABLE>{h, std::move(rowVector)};
+    }
+};
+
+void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& today) {
+    const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, today);
+    if (!yesterday.has_value()) return;
+
+    std::apply([&]<typename... T>(const T&... table) {
+        ([&] {
+            if constexpr (IncrementalTable<T>) {
+                const fs::path file = getNewestFileForTable(yesterday.value(), table.name).value();
+                FullTable yesterdayData = FullTable<T>::readFromFile(file);
+                const Header& h = yesterdayData.header;
+                const std::string query = incrementalSelectYesterdayQuery<T>(table.name, std::to_string(h.firstRowKey), std::to_string(h.lastRowKey));
+                std::cout << "table = " << table.name << '\n';
+                std::cout << "first = " << h.firstRowKey << " second = " << h.lastRowKey << '\n';
+
+                pqxx::result result = transaction.exec(query);
+                std::vector<typename T::tuple> tuplesFromQuery;
+                for (const auto& row : result) {
+                    std::tuple tuple = rowToTuple<typename T::tuple>(row);
+                    tuplesFromQuery.push_back(std::move(tuple));
+                }
+                // At this point there are now 3 copies of the table's data in memory
+
+                const auto uwu = std::min(tuplesFromQuery.size(), yesterdayData.rows.size());
+                for (int i = 0; i < uwu; i++) {
+                    const auto& a = tuplesFromQuery[i];
+                    const auto& b = yesterdayData.rows[i];
+                    if (a != b) {
+                        if constexpr (std::is_same_v<T, Signs>) {
+                            std::cout << "created_at = " << std::get<int64_t>(a) << ", " << std::get<int64_t>(b) << '\n';
+                            std::cout << "x = " << std::get<0>(a) << ", " << std::get<0>(b) << '\n';
+                        }
+                        std::cout << "uh oh stinky " << i << "\n";
+                    }
+                }
+                auto rowNumDif = static_cast<ssize_t>(tuplesFromQuery.size()) - static_cast<ssize_t>(yesterdayData.rows.size());
+                auto querySz = tuplesFromQuery.size();
+                auto yesterdaySz = yesterdayData.rows.size();
+                if (rowNumDif > 0) {
+                    std::cout << rowNumDif << " new rows!!\n";
+                } else if (rowNumDif < 0) {
+                    std::cout << "???\n";
+                }
+
+            }
+        }(), ...);
+    }, tables);
+
 }
 
 int main(int argc, char** argv)
@@ -396,15 +510,18 @@ int main(int argc, char** argv)
         const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
         const auto rootOutput = fs::path{"output"};
-        const auto out = rootOutput / std::to_string(millis);
+        const auto out = rootOutput / std::to_string(millis); // output for today
         std::cout << "Creating output directory at " << out << '\n';
-        fs::create_directories(out);
+        //fs::create_directories(out);
 
         auto t0 = std::chrono::system_clock::now();
 
         pqxx::work transaction{con};
 
-        runBackup(transaction, out, rootOutput);
+        //backupToday(transaction, out, rootOutput);
+        //part2(transaction, rootOutput, out);
+        auto today = fs::path{"output"} / "1604293536741" / "chat";
+        part2(transaction, rootOutput, out);
 
         auto t1 = std::chrono::system_clock::now();
 
