@@ -7,9 +7,10 @@
 #include "pqxx_extensions.h"
 
 
-template<typename Column> requires std::is_arithmetic_v<typename Column::type>
+template<typename Column, bool Unique> requires std::is_arithmetic_v<typename Column::type>
 struct Incremental {
     using column = Column; // Column the table is sorted by and will be used in query
+    static constexpr bool is_unique = Unique;
 };
 
 struct Rewrite {};
@@ -19,8 +20,8 @@ concept RewriteTable = std::is_same_v<typename T::table_type, Rewrite>;
 
 template<typename>
 constexpr bool is_incremental = false;
-template<typename T>
-constexpr bool is_incremental<Incremental<T>> = true;
+template<typename T, bool unique>
+constexpr bool is_incremental<Incremental<T, unique>> = true;
 
 template<typename T>
 concept IncrementalTable = is_incremental<typename T::table_type>;
@@ -154,11 +155,11 @@ struct ReportedBy : Column<int32_t> {
 
 struct Hits : Table<Id64, CreatedAt, X, Z, Dimension, ServerId, Legacy, TrackId> {
     //static constexpr std::string_view name = "hits";
-    using table_type = Incremental<Id64>;
+    using table_type = Incremental<Id64, true>;
 };
 
 struct Blocks : Table<X, Y, Z, BlockState, CreatedAt, Dimension, ServerId> {
-    using table_type = Incremental<CreatedAt>;
+    using table_type = Incremental<CreatedAt, false>;
 };
 
 struct Tracks : Table<Id32, FirstHitID, LastHitId, UpdatedAt, PrevTrackId, Dimension, ServerId, Legacy> {
@@ -166,11 +167,11 @@ struct Tracks : Table<Id32, FirstHitID, LastHitId, UpdatedAt, PrevTrackId, Dimen
 };
 
 struct Signs : Table<X, Y, Z, Nbt, CreatedAt, Dimension, ServerId> {
-    using table_type = Incremental<CreatedAt>;
+    using table_type = Incremental<CreatedAt, false>;
 };
 
 struct Servers : Table<Id16, Hostname> {
-    using table_type = Incremental<Id16>;
+    using table_type = Incremental<Id16, true>;
 };
 
 struct Players : Table<Id32, Uuid, Username> {
@@ -186,9 +187,9 @@ struct LastByServer : Table<ServerId, CreatedAt> {
 };
 
 struct Dimensions : Table<Ordinal, Name> {
-    using table_type = Incremental<Ordinal>;
+    using table_type = Incremental<Ordinal, true>;
 };
 
 struct Chat : Table<Data, ChatType, ReportedBy, CreatedAt, ServerId> {
-    using table_type = Incremental<CreatedAt>;
+    using table_type = Incremental<CreatedAt, false>;
 };

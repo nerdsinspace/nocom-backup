@@ -233,7 +233,17 @@ struct TableIndexOf<Table<Ts...>> {
     }
 };
 
-template<IncrementalTable TABLE>
+// returns true if the type is Incremental and its sorted by column is not unique (basically tabled with created_at)
+template<IncrementalTable T>
+constexpr bool should_do_delete_troll() {
+    return !T::table_type::is_unique;
+}
+template<RewriteTable>
+constexpr bool should_do_delete_troll() {
+    return false;
+}
+
+template<IncrementalTable TABLE> requires (should_do_delete_troll<TABLE>())
 int getEndIndex(const pqxx::result& result) {
     using column = typename TABLE::table_type::column;
     using T = typename column::type;
@@ -248,15 +258,15 @@ int getEndIndex(const pqxx::result& result) {
     }
 
     std::cout << "entire result has the same " << column::name << "\n";
-    return -1; // when begin == end you just get nothing
+    return -1;
 }
 
-template<RewriteTable>
+template<typename>
 auto getEndIndex(const pqxx::result& result) {
     return result.size() - 1;
 }
 
-template<typename TABLE> //requires is_tuple<Tuple>
+template<typename TABLE>
 void outputTable(const fs::path& file, const pqxx::result& result) {
     if (result.empty()) throw "empty result";
     using Tuple = typename TABLE::tuple;
