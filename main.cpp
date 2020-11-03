@@ -505,8 +505,11 @@ void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& 
     std::apply([&]<typename... T>(const T&... table) {
         ([&] {
             if constexpr (IncrementalTable<T>) {
-                const fs::path file = getNewestFileForTable(yesterday.value(), table.name).value();
-                FullTable yesterdayData = FullTable<T>::readFromFile(file);
+                const std::optional<fs::path> file = getNewestFileForTable(yesterday.value(), table.name);
+                // if there were no new rows in a table we do not output a file
+                // TODO: might want to still run this code but with empty data
+                if (!file.has_value()) return;
+                FullTable yesterdayData = FullTable<T>::readFromFile(file.value());
                 const Header& h = yesterdayData.header;
                 const std::string query = incrementalSelectYesterdayQuery<T>(table.name, std::to_string(h.firstRowKey), std::to_string(h.lastRowKey));
                 std::cout << "table = " << table.name << '\n';
