@@ -217,21 +217,85 @@ void writeHeader(std::ofstream& out, int rows, int64_t firstRowKey, int64_t last
     out.write(buf.data(), buf.size());
 }
 
-template<typename Tuple> requires is_tuple<Tuple>
-void outputTable(const fs::path& file, const pqxx::result& result, std::optional<std::pair<int64_t, int64_t>> firstLast) {
+template<typename>
+struct TableIndexOf;
+template<typename... Ts>
+struct TableIndexOf<Table<Ts...>> {
+    template<typename T>
+    static consteval size_t get() {
+        constexpr bool results[]{std::is_same_v<T, Ts>...};
+        for (size_t i = 0; i < std::size(results); i++) {
+            if (results[i]) return i;
+        }
+        return -1;
+        // this throw should be valid but gcc doesnt like it
+        //throw "type not in table";
+    }
+};
+
+template<IncrementalTable TABLE>
+int getEndIndex(const pqxx::result& result) {
+    using column = typename TABLE::table_type::column;
+    using T = typename column::type;
+    constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
+    const auto& back = result.back();
+    const T last = ParseField<T>{}(back[columnIndex]).value();
+
+    for (int i = result.size() - 1; i >= 0; i--) {
+        if (ParseField<T>{}(result[i][columnIndex]).value() != last) {
+            return i;
+        }
+    }
+
+    std::cout << "entire result has the same " << column::name << "\n";
+    return -1; // when begin == end you just get nothing
+}
+
+template<RewriteTable>
+auto getEndIndex(const pqxx::result& result) {
+    return result.size() - 1;
+}
+
+template<typename TABLE> //requires is_tuple<Tuple>
+void outputTable(const fs::path& file, const pqxx::result& result) {
+    if (result.empty()) throw "empty result";
+    using Tuple = typename TABLE::tuple;
+
     std::cout << "Outputting table to " << file.string() << '\n';
     std::ofstream out(file, std::ios_base::out | std::ios_base::binary);
     out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
-    if (firstLast) {
-        writeHeader(out, result.size(), firstLast->first, firstLast->second);
+
+    const int last = getEndIndex<TABLE>(result);
+    const int numRows = last + 1;
+
+    if (last >= 0)  {
+        if constexpr (IncrementalTable<TABLE>) {
+            const std::tuple firstTuple = rowToTuple<typename TABLE::tuple>(result.front());
+            using column = typename TABLE::table_type::column;
+            constexpr size_t tupleIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
+
+            const auto firstElement = std::get<tupleIndex>(firstTuple);
+            if (numRows > 1) {
+                const std::tuple lastTuple  = rowToTuple<typename TABLE::tuple>(result[last]);
+                const auto lastElement = std::get<tupleIndex>(lastTuple);
+
+                writeHeader(out, numRows, firstElement, lastElement);
+            } else {
+                // very unlikely but possible
+                writeHeader(out, numRows, firstElement, firstElement);
+            }
+        } else {
+            writeHeader(out, numRows, -666, -666);
+        }
     } else {
-        writeHeader(out, result.size(), -1, -1);
+        writeHeader(out, 0, -666, -666);
+        return;
     }
 
-
     int64_t lastRowPosition = 0;
-    for (const pqxx::row& row : result) {
+    for (int i = 0; i <= last; i++) {
+        const pqxx::row& row = result[i];
         const auto tuple = rowToTuple<Tuple>(row);
         char allocator_buffer[1000000]; // should be more than enough for any row
         // this looks like it generates bad code so I might replace this with something simpler
@@ -275,21 +339,6 @@ Tuple readTuple(std::ifstream& in) {
     return ReadTupleImpl<Tuple>::impl(in);
 }
 
-template<typename>
-struct TableIndexOf;
-template<typename... Ts>
-struct TableIndexOf<Table<Ts...>> {
-    template<typename T>
-    static consteval size_t get() {
-        constexpr bool results[]{std::is_same_v<T, Ts>...};
-        for (size_t i = 0; i < std::size(results); i++) {
-            if (results[i]) return i;
-        }
-        return -1;
-        // this throw should be valid but gcc doesnt like it
-        //throw "type not in table";
-    }
-};
 
 template<typename TABLE>
 std::optional<typename TABLE::tuple> readNewestRow(const fs::path& file) {
@@ -390,19 +439,7 @@ void backupToday(pqxx::work& transaction, const fs::path& outDir, const fs::path
         std::cout << result.size() << " rows\n";
         if (result.empty()) return 0;
 
-        if constexpr (IncrementalTable<T>) {
-            // TODO: move this code into outputTuple
-            const std::tuple firstTuple = rowToTuple<typename T::tuple>(result.front());
-            const std::tuple lastTuple  = rowToTuple<typename T::tuple>(result.back()); // TODO: check if 1 row was returned
-            using column = typename T::table_type::column;
-            constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
-            const auto first = std::get<tupleIndex>(firstTuple);
-            const auto last = std::get<tupleIndex>(lastTuple);
-
-            outputTable<typename T::tuple>(file, result, {{first, last}});
-        } else {
-            outputTable<typename T::tuple>(file, result, std::nullopt);
-        }
+        outputTable<T>(file, result);
 
         return result.size();
     };
@@ -486,8 +523,8 @@ void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& 
                     }
                 }
                 auto rowNumDif = static_cast<ssize_t>(tuplesFromQuery.size()) - static_cast<ssize_t>(yesterdayData.rows.size());
-                auto querySz = tuplesFromQuery.size();
-                auto yesterdaySz = yesterdayData.rows.size();
+                //auto querySz = tuplesFromQuery.size();
+                //auto yesterdaySz = yesterdayData.rows.size();
                 if (rowNumDif > 0) {
                     std::cout << rowNumDif << " new rows!!\n";
                 } else if (rowNumDif < 0) {
@@ -512,16 +549,16 @@ int main(int argc, char** argv)
         const auto rootOutput = fs::path{"output"};
         const auto out = rootOutput / std::to_string(millis); // output for today
         std::cout << "Creating output directory at " << out << '\n';
-        //fs::create_directories(out);
+        fs::create_directories(out);
 
         auto t0 = std::chrono::system_clock::now();
 
         pqxx::work transaction{con};
 
-        //backupToday(transaction, out, rootOutput);
-        //part2(transaction, rootOutput, out);
-        auto today = fs::path{"output"} / "1604293536741" / "chat";
+        backupToday(transaction, out, rootOutput);
         part2(transaction, rootOutput, out);
+        auto today = fs::path{"output"} / "1604293536741" / "chat";
+        //part2(transaction, rootOutput, out);
 
         auto t1 = std::chrono::system_clock::now();
 
