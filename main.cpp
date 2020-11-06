@@ -266,6 +266,19 @@ auto getEndIndex(const pqxx::result& result) {
     return result.size() - 1;
 }
 
+template<typename... Ts>
+void writeTuple(std::ofstream& out, const std::tuple<Ts...>& tuple) {
+    char allocator_buffer[1000000]; // should be more than enough for any row
+    // this looks like it generates bad code so I might replace this with something simpler
+    std::pmr::monotonic_buffer_resource resource(allocator_buffer, sizeof(allocator_buffer));
+    std::pmr::vector<char> buffer{&resource};
+    buffer.reserve(sizeof(allocator_buffer));
+
+    serializeTupleToBuffer(tuple, buffer);
+
+    out.write(buffer.data(), buffer.size());
+}
+
 template<typename TABLE>
 void outputTable(const fs::path& file, const pqxx::result& result) {
     if (result.empty()) throw "empty result";
@@ -307,16 +320,9 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
     for (int i = 0; i <= last; i++) {
         const pqxx::row& row = result[i];
         const auto tuple = rowToTuple<Tuple>(row);
-        char allocator_buffer[1000000]; // should be more than enough for any row
-        // this looks like it generates bad code so I might replace this with something simpler
-        std::pmr::monotonic_buffer_resource resource(allocator_buffer, sizeof(allocator_buffer));
-        std::pmr::vector<char> buffer{&resource};
-        buffer.reserve(sizeof(allocator_buffer));
-
-        serializeTupleToBuffer(tuple, buffer);
 
         lastRowPosition = out.tellp();
-        out.write(buffer.data(), buffer.size());
+        writeTuple(out, tuple);
     }
 
     out.seekp(Header::lastRowPosOffset());
@@ -348,7 +354,6 @@ template<typename Tuple>
 Tuple readTuple(std::ifstream& in) {
     return ReadTupleImpl<Tuple>::impl(in);
 }
-
 
 template<typename TABLE>
 std::optional<typename TABLE::tuple> readNewestRow(const fs::path& file) {
@@ -476,13 +481,14 @@ void backupToday(pqxx::work& transaction, const fs::path& outDir, const fs::path
     }, tables);
 }
 
+
 // represents all or part of a table's data in memory
 template<typename TABLE>
-struct FullTable {
+struct TableData {
     Header header;
     std::vector<typename TABLE::tuple> rows;
 
-    static FullTable readFromFile(const fs::path& file) {
+    static TableData readFromFile(const fs::path& file) {
         std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
         in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
 
@@ -494,9 +500,40 @@ struct FullTable {
             rowVector.push_back(std::move(tuple));
         }
 
-        return FullTable<TABLE>{h, std::move(rowVector)};
+        return TableData<TABLE>{h, std::move(rowVector)};
     }
 };
+
+template<IncrementalTable TABLE>
+void writeTableData(const fs::path& file, const std::vector<typename TABLE::tuple>& data) {
+    std::ofstream out(file, std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+    out.exceptions(std::ios_base::badbit | std::ios_base::failbit);
+
+    using column = typename TABLE::table_type::column;
+    using T = typename column::type;
+    constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
+
+    const auto element = [](const typename TABLE::tuple& tuple) {
+        return std::get<columnIndex>(tuple);
+    };
+
+    if (data.empty()) {
+        writeHeader(out, 0, -666, -666);
+        return;
+    }  else {
+        writeHeader(out, data.size(), element(data.front()), element(data.back()));
+    }
+
+    int64_t lastRowPosition = 0;
+    for (const auto& tuple : data) {
+        lastRowPosition = out.tellp();
+        writeTuple(out, tuple);
+    }
+
+    out.seekp(Header::lastRowPosOffset());
+    const std::array chars = toCharArray(lastRowPosition);
+    out.write(chars.data(), chars.size());
+}
 
 void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& today) {
     const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, today);
@@ -505,49 +542,56 @@ void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& 
     std::apply([&]<typename... T>(const T&... table) {
         ([&] {
             if constexpr (IncrementalTable<T>) {
+                // TODO: backups may generate multiple files so we probably want to check all of them and rewrite all of them
                 const std::optional<fs::path> file = getNewestFileForTable(yesterday.value(), table.name);
                 // if there were no new rows in a table we do not output a file
                 // TODO: might want to still run this code but with empty data
                 if (!file.has_value()) return;
-                FullTable yesterdayData = FullTable<T>::readFromFile(file.value());
+                TableData yesterdayData = TableData<T>::readFromFile(file.value()); // this is the data we are checking
                 const Header& h = yesterdayData.header;
                 const std::string query = incrementalSelectYesterdayQuery<T>(table.name, std::to_string(h.firstRowKey), std::to_string(h.lastRowKey));
                 std::cout << "table = " << table.name << '\n';
                 std::cout << "first = " << h.firstRowKey << " second = " << h.lastRowKey << '\n';
 
                 pqxx::result result = transaction.exec(query);
-                std::vector<typename T::tuple> tuplesFromQuery;
+                std::vector<typename T::tuple> tuplesFromQuery; // this is the definitely correct data
                 for (const auto& row : result) {
                     std::tuple tuple = rowToTuple<typename T::tuple>(row);
                     tuplesFromQuery.push_back(std::move(tuple));
                 }
                 // At this point there are now 3 copies of the table's data in memory
 
+                bool oldDataGood = true;
                 const auto uwu = std::min(tuplesFromQuery.size(), yesterdayData.rows.size());
                 for (int i = 0; i < uwu; i++) {
-                    const auto& a = tuplesFromQuery[i];
-                    const auto& b = yesterdayData.rows[i];
+                    const auto& a = tuplesFromQuery[i]; // new
+                    const auto& b = yesterdayData.rows[i]; // old
                     if (a != b) {
                         if constexpr (std::is_same_v<T, Signs>) {
                             std::cout << "created_at = " << std::get<int64_t>(a) << ", " << std::get<int64_t>(b) << '\n';
                             std::cout << "x = " << std::get<0>(a) << ", " << std::get<0>(b) << '\n';
                         }
                         std::cout << "uh oh stinky " << i << "\n";
+                        oldDataGood = false;
                     }
                 }
-                auto rowNumDif = static_cast<ssize_t>(tuplesFromQuery.size()) - static_cast<ssize_t>(yesterdayData.rows.size());
-                //auto querySz = tuplesFromQuery.size();
-                //auto yesterdaySz = yesterdayData.rows.size();
+                const auto rowNumDif = static_cast<ssize_t>(tuplesFromQuery.size()) - static_cast<ssize_t>(yesterdayData.rows.size());
                 if (rowNumDif > 0) {
                     std::cout << rowNumDif << " new rows!!\n";
                 } else if (rowNumDif < 0) {
-                    std::cout << "???\n";
+                    // we somehow LOST rows
+                    std::cout << "We somehow lost " << rowNumDif << " rows\n";
                 }
+                oldDataGood &= (rowNumDif == 0);
+                if (!oldDataGood) {
+                    // TODO: write tuplesFromQuery to yesterday's file
+                    writeTableData<T>(file.value(), tuplesFromQuery);
+                } else {
 
+                }
             }
         }(), ...);
     }, tables);
-
 }
 
 int main(int argc, char** argv)
@@ -570,8 +614,6 @@ int main(int argc, char** argv)
 
         backupToday(transaction, out, rootOutput);
         part2(transaction, rootOutput, out);
-        auto today = fs::path{"output"} / "1604293536741" / "chat";
-        //part2(transaction, rootOutput, out);
 
         auto t1 = std::chrono::system_clock::now();
 
