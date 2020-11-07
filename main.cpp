@@ -108,7 +108,7 @@ std::optional<uint64_t> pathNameAsTimestamp(const fs::path& path) {
     }
 }
 
-std::vector<fs::path> getOldOutputsSorted(const fs::path& dir) {
+std::vector<fs::path> getAllOutputsSorted(const fs::path& dir) {
     std::vector<fs::path> paths;
     for (auto& p : fs::directory_iterator{dir}) {
         if (pathNameAsTimestamp(p).has_value()) {
@@ -125,26 +125,26 @@ std::vector<fs::path> getOldOutputsSorted(const fs::path& dir) {
     return paths;
 }
 
+std::vector<fs::path> getOldOutputsSorted(const fs::path& dir, const fs::path& today) {
+    std::vector<fs::path> paths = getAllOutputsSorted(dir);
+    paths.erase(std::remove_if(paths.begin(), paths.end(), [&](const fs::path& p) {
+        return p == today;
+    }), paths.end());
+
+    return paths;
+}
+
 // Today's output has already been created so we want to be able to ignore it
 std::optional<fs::path> getNewestOutput(const fs::path& dir, const fs::path& today) {
-    std::vector<fs::path> paths = getOldOutputsSorted(dir);
-    auto it = std::find_if_not(paths.begin(), paths.end(), [&](const fs::path& p) { return p == today; });
-    if (it != paths.end()) {
-        return std::move(*it);
+    std::vector<fs::path> paths = getOldOutputsSorted(dir, today);
+    if (!paths.empty()) {
+        return paths.back();
     } else {
         return {};
     }
 }
 
-Header readHeader(const fs::path& file) {
-    auto troll = file.string();
-    std::ifstream in{file, std::ios_base::in | std::ios_base::binary};
-    in.exceptions(std::ios_base::badbit | std::ios_base::failbit);
-    return Serializable<Header>::deserialize(in);
-}
-
-
-std::optional<fs::path> getNewestFileForTable(const fs::path& dir, std::string_view tableName) {
+std::optional<fs::path> getNewestFileForTableInOutput(const fs::path& dir, std::string_view tableName) {
     std::vector<fs::path> files;
     for (const auto& p : fs::directory_iterator{dir}) {
         const auto name = p.path().filename().string();
@@ -159,6 +159,14 @@ std::optional<fs::path> getNewestFileForTable(const fs::path& dir, std::string_v
         return !numStr.empty() ? std::stoi(numStr) : 0;
     };
     return *std::ranges::max_element(files, {}, fileNumber);
+}
+
+std::optional<fs::path> getNewestFileForTable(const std::vector<fs::path>& outputsSorted, std::string_view tableName) {
+    for (const auto& p : outputsSorted) {
+        std::optional file = getNewestFileForTableInOutput(p, tableName);
+        if (file) return file.value();
+    }
+    return {};
 }
 
 
@@ -235,15 +243,15 @@ struct TableIndexOf<Table<Ts...>> {
 
 // returns true if the type is Incremental and its sorted by column is not unique (basically tabled with created_at)
 template<IncrementalTable T>
-constexpr bool should_do_delete_troll() {
+constexpr bool should_ignore_newest_rows() {
     return !T::table_type::is_unique;
 }
 template<RewriteTable>
-constexpr bool should_do_delete_troll() {
+constexpr bool should_ignore_newest_rows() {
     return false;
 }
 
-template<IncrementalTable TABLE> requires (should_do_delete_troll<TABLE>())
+template<IncrementalTable TABLE> requires (should_ignore_newest_rows<TABLE>())
 int getEndIndex(const pqxx::result& result) {
     using column = typename TABLE::table_type::column;
     using T = typename column::type;
@@ -305,13 +313,16 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
 
                 writeHeader(out, numRows, firstElement, lastElement);
             } else {
-                // very unlikely but possible
+                // we only output a single row. very unlikely but possible
+                // separate branch for this is also technically unnecessary
                 writeHeader(out, numRows, firstElement, firstElement);
             }
         } else {
+            // rewrite tables dont have keys
             writeHeader(out, numRows, -666, -666);
         }
     } else {
+        // no rows
         writeHeader(out, 0, -666, -666);
         return;
     }
@@ -379,8 +390,6 @@ template<typename... Columns>
 struct ColumnNamesImpl<Table<Columns...>> {
     static std::string get() {
         std::string str = ((std::string{Columns::name} + ", ") + ...);
-        //std::string str;
-        //((str += Columns::name, str += ", "), ...);
         str.pop_back();
         str.pop_back();
         return str;
@@ -450,7 +459,7 @@ void backupToday(pqxx::work& transaction, const fs::path& outDir, const fs::path
         }
 
         std::cout << query << '\n';
-        pqxx::result result = transaction.exec(query); // might want to put this outside of the lambda
+        pqxx::result result = transaction.exec(query);
         std::cout << result.size() << " rows\n";
         if (result.empty()) return 0;
 
@@ -460,10 +469,12 @@ void backupToday(pqxx::work& transaction, const fs::path& outDir, const fs::path
     };
 
 
-    const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, outDir);
+    // TODO: we need to consider all previous outputs instead of just yesterday
+    //const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, outDir);
+    const std::vector<fs::path> oldOutputs = getOldOutputsSorted(rootOutput, outDir);
     std::apply([&]<typename... T>(const T&... table) {
         ([&] {
-            const std::optional<fs::path> lastDiff = yesterday.has_value() ? getNewestFileForTable(yesterday.value(), table.name) : std::nullopt;
+            const std::optional<fs::path> lastDiff = !oldOutputs.empty() ? getNewestFileForTable(oldOutputs, table.name) : std::nullopt;
 
             const fs::path firstFile = outDir / table.name;
             int rows = output(table, firstFile, lastDiff);
@@ -519,20 +530,19 @@ void writeTableData(const fs::path& file, const std::vector<typename TABLE::tupl
 
     if (data.empty()) {
         writeHeader(out, 0, -666, -666);
-        return;
     }  else {
         writeHeader(out, data.size(), element(data.front()), element(data.back()));
-    }
 
-    int64_t lastRowPosition = 0;
-    for (const auto& tuple : data) {
-        lastRowPosition = out.tellp();
-        writeTuple(out, tuple);
-    }
+        int64_t lastRowPosition = 0;
+        for (const auto& tuple : data) {
+            lastRowPosition = out.tellp();
+            writeTuple(out, tuple);
+        }
 
-    out.seekp(Header::lastRowPosOffset());
-    const std::array chars = toCharArray(lastRowPosition);
-    out.write(chars.data(), chars.size());
+        out.seekp(Header::lastRowPosOffset());
+        const std::array chars = toCharArray(lastRowPosition);
+        out.write(chars.data(), chars.size());
+    }
 }
 
 void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& today) {
@@ -542,10 +552,10 @@ void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& 
     std::apply([&]<typename... T>(const T&... table) {
         ([&] {
             if constexpr (IncrementalTable<T>) {
-                // TODO: backups may generate multiple files so we probably want to check all of them and rewrite all of them
-                const std::optional<fs::path> file = getNewestFileForTable(yesterday.value(), table.name);
-                // if there were no new rows in a table we do not output a file
-                // TODO: might want to still run this code but with empty data
+                // TODO: backups may generate multiple files so we want to check all of them and rewrite all of them
+                const std::optional<fs::path> file = getNewestFileForTableInOutput(yesterday.value(), table.name);
+                // If there were no new rows in a table we do not output a file.
+                // We can not check if an empty file is correct because we can not put an upper bound on the query.
                 if (!file.has_value()) return;
                 TableData yesterdayData = TableData<T>::readFromFile(file.value()); // this is the data we are checking
                 const Header& h = yesterdayData.header;
@@ -579,12 +589,12 @@ void part2(pqxx::work& transaction, const fs::path& rootOutput, const fs::path& 
                 if (rowNumDif > 0) {
                     std::cout << rowNumDif << " new rows!!\n";
                 } else if (rowNumDif < 0) {
-                    // we somehow LOST rows
+                    // we somehow LOST rows??
                     std::cout << "We somehow lost " << rowNumDif << " rows\n";
                 }
                 oldDataGood &= (rowNumDif == 0);
+
                 if (!oldDataGood) {
-                    // TODO: write tuplesFromQuery to yesterday's file
                     writeTableData<T>(file.value(), tuplesFromQuery);
                 } else {
 
