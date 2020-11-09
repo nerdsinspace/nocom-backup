@@ -12,6 +12,14 @@ struct UUID {
     unsigned char bytes[16];
 };
 
+// TODO: replace binarystring completely?
+// binarystring isn't default constructible which trolls the shitty stream code
+struct binary : pqxx::binarystring {
+    using pqxx::binarystring::binarystring;
+    binary() : pqxx::binarystring(std::string_view{}) {}
+    binary(const pqxx::binarystring& data) : pqxx::binarystring(data) {}
+};
+
 inline unsigned hex_to_digit(char hex) {
     auto x = static_cast<unsigned char>(hex);
     if (x >= '0' and x <= '9')
@@ -25,6 +33,12 @@ inline unsigned hex_to_digit(char hex) {
 }
 
 namespace pqxx {
+    template<>
+    struct string_traits<binary> : string_traits<pqxx::binarystring> {};
+
+    template<> struct nullness<binary> : no_null<pqxx::binarystring> {};
+
+
     template<>
     struct string_traits<placeholder> {
         static placeholder from_string(std::string_view) {

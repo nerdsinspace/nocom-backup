@@ -187,3 +187,6 @@ struct Serializable<pqxx::binarystring> {
         return pqxx::binarystring{std::move(shared), static_cast<size_type>(len)};
     }
 };
+
+template<>
+struct Serializable<binary> : Serializable<pqxx::binarystring> {};

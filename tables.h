@@ -7,7 +7,8 @@
 #include "pqxx_extensions.h"
 
 
-template<typename Column, bool Unique> requires std::is_arithmetic_v<typename Column::type>
+// The code assumes int64_t can represent any key column
+template<typename Column, bool Unique> requires std::is_integral_v<typename Column::type>
 struct Incremental {
     using column = Column; // Column the table is sorted by and will be used in query
     static constexpr bool is_unique = Unique;
@@ -101,7 +102,7 @@ struct PrevTrackId : Column<std::optional<int32_t>> {
     static constexpr std::string_view name = "prev_track_id";
 };
 
-struct Nbt : Column<pqxx::binarystring> {
+struct Nbt : Column<binary> {
     static constexpr std::string_view name = "nbt";
 };
 
