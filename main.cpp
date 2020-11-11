@@ -29,17 +29,13 @@ struct Header {
     int32_t version = CURRENT_VERSION;
     int32_t numRows{};
     int64_t lastRowPos = -1; // byte position in the file of the last row
-    // This will need to be changed if a table with a non number key is added.
-    // These have meaningless values for rewrite tables.
-    int64_t firstRowKey = -666; // yesterday_first_row
-    int64_t lastRowKey = -666; // yesterday_last_row
 
-    static constexpr int SIZE = sizeof(version) + sizeof(numRows) + sizeof(lastRowPos) + sizeof(firstRowKey) + sizeof(lastRowKey);
+    static constexpr int SIZE = sizeof(version) + sizeof(numRows) + sizeof(lastRowPos);
 
     explicit Header(int v, int rows, int64_t lastRow):
         version(v), numRows(rows), lastRowPos(lastRow) {}
-    explicit Header(int v, int rows, int64_t lastRow, int64_t firstKey, int64_t lastKey):
-        version(v), numRows(rows), lastRowPos(lastRow), firstRowKey(firstKey), lastRowKey(lastKey) {}
+    explicit Header(int rows, int64_t lastRow):
+        numRows(rows), lastRowPos(lastRow) {}
     explicit Header(int rows): numRows(rows) {}
     explicit Header() = default;
 
@@ -60,8 +56,6 @@ struct Serializable<Header> {
         Serializable<int32_t>::serialize(vec, h.version);
         Serializable<int32_t>::serialize(vec, h.numRows);
         Serializable<int64_t>::serialize(vec, h.lastRowPos);
-        Serializable<int64_t>::serialize(vec, h.firstRowKey);
-        Serializable<int64_t>::serialize(vec, h.lastRowKey);
     }
 
     static Header deserialize(std::ifstream& in) {
@@ -69,8 +63,6 @@ struct Serializable<Header> {
           Serializable<int32_t>::deserialize(in), // version
           Serializable<int32_t>::deserialize(in), // numRows
           Serializable<int64_t>::deserialize(in), // lastRowPos
-          Serializable<int64_t>::deserialize(in), // firstRowKey
-          Serializable<int64_t>::deserialize(in)  // lastRowKey
         };
     }
 };
@@ -239,9 +231,6 @@ void writeHeader(std::ofstream& out, int rows) {
     writeToFile(out, Header{rows});
 }
 
-void writeHeader(std::ofstream& out, int rows, int64_t firstRowKey, int64_t lastRowKey) {
-    writeToFile(out, Header{Header::CURRENT_VERSION, rows, -1, firstRowKey, lastRowKey});
-}
 
 template<typename>
 struct TableIndexOf;
@@ -324,29 +313,10 @@ void outputTable(const fs::path& file, const pqxx::result& result) {
     const int numRows = last + 1;
 
     if (last >= 0)  {
-        if constexpr (IncrementalTable<TABLE>) {
-            const std::tuple firstTuple = rowToTuple<typename TABLE::tuple>(result.front());
-            using column = typename TABLE::table_type::column;
-            constexpr size_t tupleIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
-
-            const auto firstElement = std::get<tupleIndex>(firstTuple);
-            if (numRows > 1) {
-                const std::tuple lastTuple  = rowToTuple<typename TABLE::tuple>(result[last]);
-                const auto lastElement = std::get<tupleIndex>(lastTuple);
-
-                writeHeader(out, numRows, firstElement, lastElement);
-            } else {
-                // we only output a single row. very unlikely but possible
-                // separate branch for this is also technically unnecessary
-                writeHeader(out, numRows, firstElement, firstElement);
-            }
-        } else {
-            // rewrite tables dont have keys
-            writeHeader(out, numRows, -666, -666);
-        }
+        writeHeader(out, numRows);
     } else {
         // no rows
-        writeHeader(out, 0, -666, -666);
+        writeHeader(out, 0);
         return;
     }
 
@@ -533,7 +503,7 @@ void runBackupForRange(pqxx::work& tx, const fs::path& output, const int64_t beg
     int n = 0;
     int rowsReceived = 0;
     const auto makeHeader = [&] {
-        return Header{Header::CURRENT_VERSION, rowsReceived, lastRowPosition, begin, end};
+        return Header{rowsReceived, lastRowPosition};
     };
     for (const auto& tuple : streamTable<TABLE>(tx, query)) {
         if (rowsReceived >= ROW_LIMIT) {
@@ -590,9 +560,10 @@ void writeTableData(const fs::path& file, const std::vector<typename TABLE::tupl
     };
 
     if (data.empty()) {
-        writeHeader(out, 0, -666, -666);
+        writeHeader(out, 0);
     }  else {
-        writeHeader(out, data.size(), element(data.front()), element(data.back()));
+        // element(data.front()), element(data.back())
+        writeHeader(out, data.size());
 
         int64_t lastRowPosition = 0;
         for (const auto& tuple : data) {
@@ -604,6 +575,15 @@ void writeTableData(const fs::path& file, const std::vector<typename TABLE::tupl
         const std::array chars = toCharArray(lastRowPosition);
         out.write(chars.data(), chars.size());
     }
+}
+
+template<typename TABLE>
+auto& getKeyElement(const typename TABLE::tuple& tuple) {
+    using column = typename TABLE::table_type::column;
+    using T = typename column::type;
+    constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
+
+    return std::get<columnIndex>(tuple);
 }
 
 void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
@@ -622,10 +602,17 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                 for (const auto& file : outputFiles) {
                     const TableData yesterdayData = TableData<T>::readFromFile(file); // this is the data we are checking
                     const Header& h = yesterdayData.header;
-                    const std::string query = incrementalSelectRangeQuery<T>(table.name, std::to_string(h.firstRowKey), std::to_string(h.lastRowKey));
+                    // TODO: check if data is empty (shouldn't happen)
+                    // data is in ascending order
+                    const auto firstKey = getKeyElement<T>(yesterdayData.rows.front());
+                    const auto lastKey = getKeyElement<T>(yesterdayData.rows.back());
+                    if (firstKey > lastKey) {
+                        throw "trolled";
+                    }
+                    const std::string query = incrementalSelectRangeQuery<T>(table.name, std::to_string(firstKey), std::to_string(lastKey));
 
                     std::cout << "table = " << table.name << '\n';
-                    std::cout << "first = " << h.firstRowKey << " second = " << h.lastRowKey << '\n';
+                    std::cout << "first = " << firstKey << " second = " << lastKey << '\n';
 
                     const pqxx::result result = tx.exec(query);
                     std::vector<typename T::tuple> tuplesFromQuery; // this is the definitely correct data
@@ -661,7 +648,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                     if (!oldDataGood) {
                         //writeTableData<T>(file, tuplesFromQuery);
                         std::cout << "yay rerunning backup for " << table.name << "!\n";
-                        runBackupForRange<T>(tx, today, h.firstRowKey, h.lastRowKey); // we assume that the file is now correct
+                        runBackupForRange<T>(tx, today, firstKey, lastKey); // we assume that the file is now correct
                         break;
                     } else {
 

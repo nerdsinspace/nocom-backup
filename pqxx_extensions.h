@@ -3,9 +3,7 @@
 #include <pqxx/pqxx>
 
 
-struct placeholder {
-    //placeholder(const auto&) {}
-};
+struct placeholder {};
 
 // stupid library doesnt support UUIDs
 struct UUID {
