@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ranges>
+#include <span>
 
 #include <pqxx/pqxx>
 #include <args.hxx>
@@ -76,6 +77,11 @@ template<typename>
 constexpr bool is_optional = false;
 template<typename T>
 constexpr bool is_optional<std::optional<T>> = true;
+
+template<IncrementalTable T>
+using key_column = typename T::table_type::column;
+template<IncrementalTable T>
+using key_type = typename T::table_type::column::type;
 
 
 // TODO: make table names constexpr
@@ -260,8 +266,8 @@ constexpr bool should_ignore_newest_rows() {
 
 template<IncrementalTable TABLE> requires (should_ignore_newest_rows<TABLE>())
 int getEndIndex(const pqxx::result& result) {
-    using column = typename TABLE::table_type::column;
-    using T = typename column::type;
+    using column = key_column<TABLE>;
+    using T = key_type<TABLE>;
     constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
     const auto& back = result.back();
     const T last = ParseField<T>{}(back[columnIndex]).value();
@@ -441,7 +447,7 @@ void backupToday(pqxx::work& tx, const fs::path& outDir, const fs::path& rootOut
             if (lastDiff.has_value()) {
                 const std::optional newestRow = readNewestRow<T>(*lastDiff);
                 if (newestRow.has_value()) {
-                    using column = typename T::table_type::column;
+                    using column = key_column<T>;
                     constexpr size_t tupleIndex = TableIndexOf<typename T::base_type>::template get<column>();
                     const auto newest = std::get<tupleIndex>(newestRow.value());
 
@@ -551,8 +557,8 @@ template<IncrementalTable TABLE>
 void writeTableData(const fs::path& file, const std::vector<typename TABLE::tuple>& data) {
     std::ofstream out = newOutputStream(file);
 
-    using column = typename TABLE::table_type::column;
-    using T = typename column::type;
+    using column = key_column<TABLE>;
+    using T = key_type<TABLE>;
     constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
 
     const auto element = [](const typename TABLE::tuple& tuple) {
@@ -579,11 +585,43 @@ void writeTableData(const fs::path& file, const std::vector<typename TABLE::tupl
 
 template<typename TABLE>
 auto& getKeyElement(const typename TABLE::tuple& tuple) {
-    using column = typename TABLE::table_type::column;
-    using T = typename column::type;
+    using column = key_column<TABLE>;
+    using T = key_type<TABLE>;
     constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
 
     return std::get<columnIndex>(tuple);
+}
+
+
+template<typename T>
+auto equalTo(const T* x) {
+    return [x](const T& y) {
+        return *x == y;
+    };
+}
+
+template<typename TABLE>
+auto nextRangeForKey(std::span<const typename TABLE::tuple> tuples, const key_type<TABLE>& key) {
+    if (tuples.empty()) throw std::logic_error{"empty span"};
+
+    const auto it = std::ranges::find_if_not(tuples, equalTo(&key), [](const auto& tuple) { return getKeyElement<TABLE>(tuple); });
+
+    const auto begin = tuples.begin();
+    const auto end = it == tuples.end() ? it : it + 1;
+    return std::span{begin, end};
+}
+
+// This is technically incorrect and can be slightly wrong when duplicate data is involved but that shouldn't ever be a problem
+template<typename T>
+bool unorderedEqual(std::span<const T> a, std::span<const T> b) {
+    if (a.size() != b.size()) throw std::logic_error{"must be same size"};
+
+    for (const auto& i : a) {
+        if (std::ranges::none_of(b, equalTo(&i))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
@@ -602,41 +640,53 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                 for (const auto& file : outputFiles) {
                     const TableData yesterdayData = TableData<T>::readFromFile(file); // this is the data we are checking
                     const Header& h = yesterdayData.header;
-                    // TODO: check if data is empty (shouldn't happen)
+                    const auto& yesterdayRows = yesterdayData.rows;
+                    // TODO: check if data is empty (shouldn't ever happen)
                     // data is in ascending order
-                    const auto firstKey = getKeyElement<T>(yesterdayData.rows.front());
-                    const auto lastKey = getKeyElement<T>(yesterdayData.rows.back());
+                    const auto& firstKey = getKeyElement<T>(yesterdayRows.front());
+                    const auto& lastKey = getKeyElement<T>(yesterdayRows.back());
                     if (firstKey > lastKey) {
                         throw "trolled";
                     }
                     const std::string query = incrementalSelectRangeQuery<T>(table.name, std::to_string(firstKey), std::to_string(lastKey));
+                    std::cout << "retry = " << query << '\n';
 
                     std::cout << "table = " << table.name << '\n';
                     std::cout << "first = " << firstKey << " second = " << lastKey << '\n';
 
-                    const pqxx::result result = tx.exec(query);
                     std::vector<typename T::tuple> tuplesFromQuery; // this is the definitely correct data
-                    for (const auto& row : result) {
-                        std::tuple tuple = rowToTuple<typename T::tuple>(row);
+                    for (auto tuple : streamTable<T>(tx, query)) {
                         tuplesFromQuery.push_back(std::move(tuple));
                     }
-                    // At this point there are now 3 copies of the table's data in memory
+                    // At this point there are now 2 copies of the table's data in memory
 
                     bool oldDataGood = true;
-                    const auto smallerSize = std::min(tuplesFromQuery.size(), yesterdayData.rows.size());
+                    const auto smallerSize = std::min(tuplesFromQuery.size(), yesterdayRows.size());
                     for (int i = 0; i < smallerSize; i++) {
-                        const auto& a = tuplesFromQuery[i]; // new
-                        const auto& b = yesterdayData.rows[i]; // old
-                        if (a != b) {
-                            if constexpr (std::is_same_v<T, Signs>) {
-                                std::cout << "created_at = " << std::get<int64_t>(a) << ", " << std::get<int64_t>(b) << '\n';
-                                std::cout << "x = " << std::get<0>(a) << ", " << std::get<0>(b) << '\n';
-                            }
-                            std::cout << "uh oh stinky " << i << "\n";
+                        const auto& key = getKeyElement<T>(tuplesFromQuery[i]);
+                        if (getKeyElement<T>(yesterdayRows[i]) != key) {
+                            // TODO: handle data not being same
+                            std::cout << "keys not lined up\n";
                             oldDataGood = false;
+                            break;
+                        }
+
+                        const std::span nextA = nextRangeForKey<T>({tuplesFromQuery.begin() + i, tuplesFromQuery.begin() + smallerSize}, key);
+                        const std::span nextB = nextRangeForKey<T>({yesterdayRows.begin() + i, yesterdayRows.begin() + smallerSize}, key);
+                        if (nextA.size() != nextB.size()) {
+                            std::cout << "ranges for key " << key << " not the same size\n";
+                            oldDataGood = false;
+                            break;
+                        }
+                        if (!unorderedEqual(nextA, nextB)) {
+                            std::cout << "ranges for key " << key << " not equivalent\n";
+                            oldDataGood = false;
+                            break;
                         }
                     }
-                    const auto rowNumDif = static_cast<ssize_t>(tuplesFromQuery.size()) - static_cast<ssize_t>(yesterdayData.rows.size());
+
+
+                    const auto rowNumDif = static_cast<ssize_t>(tuplesFromQuery.size()) - static_cast<ssize_t>(yesterdayRows.size());
                     if (rowNumDif > 0) {
                         std::cout << rowNumDif << " new rows!!\n";
                     } else if (rowNumDif < 0) {
@@ -661,6 +711,8 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
 
 int main(int argc, char** argv)
 {
+    //std::cout << orderByColumns<Signs>() << '\n';
+    //return 0;
     try {
         pqxx::connection con;
         std::cout << "Connected to " << con.dbname() << std::endl;
