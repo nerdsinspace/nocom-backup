@@ -86,16 +86,16 @@ using key_type = typename T::table_type::column::type;
 
 // TODO: make table names constexpr
 const auto tables = std::make_tuple(
-    Dimensions    {"dimensions"},
-    LastByServer  {"last_by_server"},
-    //PlayerSessions{"player_sessions"},
-    Players       {"players"},
-    Servers       {"servers"},
-    Signs         {"signs"},
-    //Tracks        {"tracks"},
-    Chat          {"chat"},
-    Hits          {"hits"},
-    Blocks        {"blocks"}
+    //Dimensions    {"dimensions"},
+    //LastByServer  {"last_by_server"},
+    ////PlayerSessions{"player_sessions"},
+    //Players       {"players"},
+    //Servers       {"servers"},
+    Signs         {"signs"}
+    ////Tracks        {"tracks"},
+    //Chat          {"chat"},
+    //Hits          {"hits"},
+    //Blocks        {"blocks"}
 );
 
 
@@ -615,6 +615,10 @@ template<typename T>
 bool unorderedEqual(std::span<const T> a, std::span<const T> b) {
     if (a.size() != b.size()) throw std::logic_error{"must be same size"};
 
+    for (const auto& y : b) {
+        const auto& uwu = y;
+    }
+
     for (const auto& i : a) {
         if (std::ranges::none_of(b, equalTo(&i))) {
             return false;
@@ -661,7 +665,9 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
 
                     bool oldDataGood = true;
                     const auto smallerSize = std::min(tuplesFromQuery.size(), yesterdayRows.size());
-                    for (int i = 0; i < smallerSize; i++) {
+                    const auto sizeA = tuplesFromQuery.size();
+                    const auto sizeB = yesterdayRows.size();
+                    for (int i = 0; i < smallerSize;) {
                         const auto& key = getKeyElement<T>(tuplesFromQuery[i]);
                         if (getKeyElement<T>(yesterdayRows[i]) != key) {
                             // TODO: handle data not being same
@@ -682,6 +688,8 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                             oldDataGood = false;
                             break;
                         }
+
+                        i += nextA.size();
                     }
 
 
