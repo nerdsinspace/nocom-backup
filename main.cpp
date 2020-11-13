@@ -604,10 +604,9 @@ template<typename TABLE>
 auto nextRangeForKey(std::span<const typename TABLE::tuple> tuples, const key_type<TABLE>& key) {
     if (tuples.empty()) throw std::logic_error{"empty span"};
 
-    const auto it = std::ranges::find_if_not(tuples, equalTo(&key), [](const auto& tuple) { return getKeyElement<TABLE>(tuple); });
-
     const auto begin = tuples.begin();
-    const auto end = it == tuples.end() ? it : it + 1;
+    const auto end = std::ranges::find_if_not(tuples, equalTo(&key), [](const auto& tuple) { return getKeyElement<TABLE>(tuple); });
+
     return std::span{begin, end};
 }
 
