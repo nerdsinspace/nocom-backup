@@ -43,6 +43,7 @@ namespace pqxx {
             return {};
         }
     };
+    template<> struct nullness<placeholder> : no_null<placeholder> {};
 
     template<>
     struct string_traits<UUID> {
@@ -64,4 +65,5 @@ namespace pqxx {
             return uuid;
         }
     };
+    template<> struct nullness<UUID> : no_null<UUID> {};
 }
