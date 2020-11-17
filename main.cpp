@@ -107,6 +107,7 @@ std::optional<uint64_t> pathNameAsTimestamp(const fs::path& path) {
     }
 }
 
+// newest -> oldest
 std::vector<fs::path> getAllOutputsSorted(const fs::path& dir) {
     std::vector<fs::path> paths;
     for (auto& p : fs::directory_iterator{dir}) {
@@ -137,7 +138,7 @@ std::vector<fs::path> getOldOutputsSorted(const fs::path& dir, const fs::path& t
 std::optional<fs::path> getNewestOutput(const fs::path& dir, const fs::path& today) {
     std::vector<fs::path> paths = getOldOutputsSorted(dir, today);
     if (!paths.empty()) {
-        return paths.back();
+        return paths.front();
     } else {
         return {};
     }
@@ -259,15 +260,6 @@ struct TableIndexOf<Table<Ts...>> {
     }
 };
 
-// returns true if the type is Incremental and its sorted by column is not unique (basically tabled with created_at)
-template<IncrementalTable T>
-constexpr bool should_ignore_newest_rows() {
-    return !T::table_type::is_unique;
-}
-template<RewriteTable>
-constexpr bool should_ignore_newest_rows() {
-    return false;
-}
 
 template<typename... Ts>
 void writeTuple(std::ofstream& out, const std::tuple<Ts...>& tuple) {
@@ -307,6 +299,7 @@ int64_t outputTable(const fs::path& output, auto&& iterable) {
 
     int64_t lastRowPosition = 0;
     int64_t rowsReceived = 0;
+
     const auto makeHeader = [&] {
         return Header{rowsReceived, lastRowPosition};
     };
@@ -488,28 +481,15 @@ void writeTableData(const fs::path& output, const std::vector<typename TABLE::tu
     outputTable(output, span);
 }
 
-// represents all or part of a table's data in memory
-template<typename TABLE>
-struct TableData {
-    const uint64_t firstRowPos;
-    const uint64_t lastRowPos;
-    std::vector<typename TABLE::tuple> rows;
-
-    static TableData readRows(std::ifstream& in, uint64_t numRows) {
-        const uint64_t first = in.tellg();
-
-        decltype(rows) rowVector;
-        rowVector.reserve(numRows);
-        uint64_t last = first;
-        for (int i = 0; i < numRows; i++) {
-            last = in.tellg();
-            auto tuple = readTuple<typename TABLE::tuple>(in);
-            rowVector.push_back(std::move(tuple));
-        }
-
-        return TableData<TABLE>{first, last, std::move(rowVector)};
-    }
-};
+// returns true if the type is Incremental and its sorted by column is not unique (basically tables with created_at)
+template<IncrementalTable T>
+constexpr bool should_ignore_newest_rows() {
+    return !T::table_type::is_unique;
+}
+template<RewriteTable>
+constexpr bool should_ignore_newest_rows() {
+    return false;
+}
 
 template<typename TABLE>
 auto& getKeyElement(const typename TABLE::tuple& tuple) {
@@ -519,6 +499,65 @@ auto& getKeyElement(const typename TABLE::tuple& tuple) {
 
     return std::get<columnIndex>(tuple);
 }
+
+// represents all or part of a table's data in memory
+template<typename TABLE>
+struct TableData {
+    const uint64_t firstRowPos;
+    const uint64_t lastRowPos; // might make more sense to change this to be the end of the region
+    std::vector<typename TABLE::tuple> rows;
+
+    // There must be at least maxRows in the stream
+    static TableData readRows(std::ifstream& in, uint64_t maxRows) {
+        const uint64_t first = in.tellg();
+
+        decltype(rows) rowVector;
+        rowVector.reserve(maxRows);
+        if constexpr (should_ignore_newest_rows<TABLE>()) {
+            const auto currentPos = in.tellg();
+            uint64_t lastRowPosition = currentPos;
+            // "unique" is kind of a bad name here
+            uint64_t endOfUniqueRows = currentPos;
+            uint64_t lastUniqueRow = currentPos;
+            key_type<TABLE> lastKey = 0;
+            int lastRows = 0;
+
+            for (int64_t i = 0; i < maxRows; i++) {
+                const int64_t prevRowPos = lastRowPosition;
+                lastRowPosition = in.tellg();
+                auto tuple = readTuple<typename TABLE::tuple>(in);
+                lastRows++;
+
+                if (auto& key = getKeyElement<TABLE>(tuple); key != lastKey) {
+                    lastKey = key;
+                    endOfUniqueRows = lastRowPosition;
+                    lastUniqueRow = prevRowPos;
+                    lastRows = 1;
+                }
+
+                rowVector.push_back(std::move(tuple));
+            }
+            if (lastRows != rowVector.size()) {
+                rowVector.erase(rowVector.end() - lastRows, rowVector.end());
+                in.seekg(endOfUniqueRows);
+
+                return TableData<TABLE>{first, lastUniqueRow, std::move(rowVector)};
+            } else { // all of the rows have the same key (this is the case for the last chunk)
+                return TableData<TABLE>{first, lastRowPosition, std::move(rowVector)};
+            }
+        } else {
+            uint64_t last = first;
+            for (int i = 0; i < maxRows; i++) {
+                last = in.tellg();
+                auto tuple = readTuple<typename TABLE::tuple>(in);
+                rowVector.push_back(std::move(tuple));
+            }
+
+            return TableData<TABLE>{first, last, std::move(rowVector)};
+        }
+    }
+};
+
 
 template<typename T>
 auto equalTo(const T* x) {
@@ -573,18 +612,19 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
             // TODO: check if file has no rows (shouldn't ever happen)
 
             for (uint64_t rowsRead = 0; rowsRead < h.numRows;) {
-                constexpr uint64_t ROW_LIMIT = 10'000;
+                constexpr uint64_t ROW_LIMIT = 10'000'000;
 
                 const auto n = std::min(h.numRows - rowsRead, ROW_LIMIT);
+                // will ignore the last few rows
                 const auto fileData = TableData<T>::readRows(stream, n);
                 const auto& fileRows = fileData.rows;
-                rowsRead += n;
+                rowsRead += fileRows.size();
 
                 // data is in ascending order
                 const auto& firstKey = getKeyElement<T>(fileRows.front());
                 const auto& lastKey = getKeyElement<T>(fileRows.back());
                 if (firstKey > lastKey) {
-                    throw "trolled";
+                    throw std::runtime_error{"trolled"};
                 }
                 const std::string query = incrementalSelectRangeQuery<T>(table.name, std::to_string(firstKey), std::to_string(lastKey));
                 std::cout << "retry = " << query << std::endl;
@@ -616,6 +656,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                         break;
                     }
                     if (!unorderedEqual(nextA, nextB)) {
+                        // TODO: this usually happens at the last chunk and is normal
                         std::cout << "ranges for key " << key << " not equivalent" << std::endl;
                         oldDataGood = false;
                         break;
@@ -640,13 +681,15 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                     const bool isLastChunk = rowsRead >= h.numRows;
                     // If the last chunk is bad then rewrite in place, else we just redo the whole file
                     if (isLastChunk) {
+                        std::cout << "fixing last chunk" << std::endl;
                         // this is close to the end and shouldn't be logged
-                        std::ofstream out{file};
+                        std::ofstream out = newOutputStream(file);
                         out.seekp(fileData.firstRowPos);
                         for (const auto& tuple : tuplesFromQuery) {
                             writeTuple(out, tuple);
                         }
                     } else {
+                        std::cout << "rewriting the whole file" << std::endl;
                         runBackupForRange<T>(tx, file, first, last);
                     }
                     break;
