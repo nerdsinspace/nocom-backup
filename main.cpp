@@ -26,17 +26,17 @@ using namespace std::literals;
 
 struct Header {
     static constexpr int CURRENT_VERSION = 1;
-    int32_t version = CURRENT_VERSION;
-    int64_t numRows{};
+    uint32_t version = CURRENT_VERSION;
+    uint64_t numRows{};
     int64_t lastRowPos = -1; // byte position in the file of the last row
 
     static constexpr int SIZE = sizeof(version) + sizeof(numRows) + sizeof(lastRowPos);
 
-    explicit Header(int v, int64_t rows, int64_t lastRow):
+    explicit Header(uint32_t v, uint64_t rows, int64_t lastRow):
         version(v), numRows(rows), lastRowPos(lastRow) {}
-    explicit Header(int64_t rows, int64_t lastRow):
+    explicit Header(uint64_t rows, int64_t lastRow):
         numRows(rows), lastRowPos(lastRow) {}
-    explicit Header(int64_t rows): numRows(rows) {}
+    explicit Header(uint64_t rows): numRows(rows) {}
     explicit Header() = default;
 
     void checkVersion() const {
@@ -60,8 +60,8 @@ struct Serializable<Header> {
 
     static Header deserialize(std::ifstream& in) {
         return Header {
-          Serializable<int32_t>::deserialize(in), // version
-          Serializable<int64_t>::deserialize(in), // numRows
+          Serializable<uint32_t>::deserialize(in), // version
+          Serializable<uint64_t>::deserialize(in), // numRows
           Serializable<int64_t>::deserialize(in), // lastRowPos
         };
     }
@@ -189,41 +189,6 @@ void visitTuple(F&& f, Tuple&& t) {
     }, std::forward<Tuple>(t));
 }
 
-template<typename T>
-struct ParseField {
-    std::optional<T> operator()(const pqxx::field& field) const {
-        return field.get<T>();
-    }
-};
-
-template<typename T>
-struct ParseField<std::optional<T>> {
-    std::optional<T> operator()(const pqxx::field& field) const {
-        return ParseField<T>{}(field);
-    }
-};
-
-template<typename T>
-auto getField(const pqxx::row& row, size_t index) {
-    std::optional maybe = ParseField<T>{}(row.at(index));
-    if constexpr (is_optional<T>) {
-        return maybe;
-    } else {
-        return std::move(maybe.value());
-    }
-}
-
-template<typename Tuple> requires is_tuple<Tuple>
-Tuple rowToTuple(const pqxx::row& row) {
-    if (row.size() != std::tuple_size_v<Tuple>) {
-        throw std::runtime_error("row size wrong!!");
-    }
-
-    return [&row]<size_t... I>(std::index_sequence<I...>) {
-        return std::make_tuple(getField<std::tuple_element_t<I, Tuple>>(row, I)...);
-    }(std::make_index_sequence<std::tuple_size_v<Tuple>>{});
-}
-
 
 template<typename Tuple> requires is_tuple<Tuple>
 void serializeTupleToBuffer(const Tuple& tuple, std::pmr::vector<char>& vec) {
@@ -298,7 +263,7 @@ int64_t outputTable(const fs::path& output, auto&& iterable) {
     out.write(zero, sizeof(zero));
 
     int64_t lastRowPosition = 0;
-    int64_t rowsReceived = 0;
+    uint64_t rowsReceived = 0;
 
     const auto makeHeader = [&] {
         return Header{rowsReceived, lastRowPosition};
@@ -475,12 +440,6 @@ void runBackupForRange(pqxx::work& tx, const fs::path& output, const int64_t fir
 }
 
 
-template<IncrementalTable TABLE>
-void writeTableData(const fs::path& output, const std::vector<typename TABLE::tuple>& data) {
-    std::span span{data.begin(), data.end()}; // just to make sure the entire vector isn't copied
-    outputTable(output, span);
-}
-
 // returns true if the type is Incremental and its sorted by column is not unique (basically tables with created_at)
 template<IncrementalTable T>
 constexpr bool should_ignore_newest_rows() {
@@ -494,7 +453,6 @@ constexpr bool should_ignore_newest_rows() {
 template<typename TABLE>
 auto& getKeyElement(const typename TABLE::tuple& tuple) {
     using column = key_column<TABLE>;
-    using T = key_type<TABLE>;
     constexpr size_t columnIndex = TableIndexOf<typename TABLE::base_type>::template get<column>();
 
     return std::get<columnIndex>(tuple);
@@ -520,9 +478,9 @@ struct TableData {
             uint64_t endOfUniqueRows = currentPos;
             uint64_t lastUniqueRow = currentPos;
             key_type<TABLE> lastKey = 0;
-            int lastRows = 0;
+            uint32_t lastRows = 0;
 
-            for (int64_t i = 0; i < maxRows; i++) {
+            for (uint64_t i = 0; i < maxRows; i++) {
                 const int64_t prevRowPos = lastRowPosition;
                 lastRowPosition = in.tellg();
                 auto tuple = readTuple<typename TABLE::tuple>(in);
@@ -547,7 +505,7 @@ struct TableData {
             }
         } else {
             uint64_t last = first;
-            for (int i = 0; i < maxRows; i++) {
+            for (uint64_t i = 0; i < maxRows; i++) {
                 last = in.tellg();
                 auto tuple = readTuple<typename TABLE::tuple>(in);
                 rowVector.push_back(std::move(tuple));
@@ -640,7 +598,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
 
                 bool oldDataGood = true;
                 const auto smallerSize = std::min(tuplesFromQuery.size(), fileRows.size());
-                for (int64_t i = 0; i < smallerSize;) {
+                for (uint64_t i = 0; i < smallerSize;) {
                     const auto& key = getKeyElement<T>(tuplesFromQuery[i]);
                     if (getKeyElement<T>(fileRows[i]) != key) {
                         std::cout << "keys not lined up" << std::endl;
