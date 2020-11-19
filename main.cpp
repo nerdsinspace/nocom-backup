@@ -156,14 +156,19 @@ std::optional<fs::path> getNewestFileForTable(std::span<const fs::path> outputsS
 
 std::optional<fs::path> getPreviousOutputFile(const fs::path& rootOutput, const fs::path& output, std::string_view tableName) {
     const std::vector<fs::path> allOutputs = getAllOutputsSorted(rootOutput);
-    const auto endIt = std::ranges::find(allOutputs, output);
+    const auto startIt = std::ranges::find(allOutputs, output);
 
-    // slightly weird way to use iterators because im afraid to use reverse iterators
-    for (auto it = std::prev(endIt); it != std::prev(allOutputs.begin()); it--) {
-        auto p = *it / tableName;
-        if (fs::exists(p)) return p;
+    if (startIt == allOutputs.end()) {
+        return {}; // shouldnt happen
+    } else {
+        for (auto it = startIt + 1; it != allOutputs.end(); it++) {
+            fs::path p = *it / tableName;
+            if (fs::exists(p)) {
+                return p;
+            }
+        }
+        return {};
     }
-    return {};
 }
 
 template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
@@ -186,7 +191,7 @@ void serializeTupleToBuffer(const Tuple& tuple, std::pmr::vector<char>& vec) {
 }
 
 template<typename T>
-void writeToFile(std::ofstream& out, const T& x) {
+void writeObjectToFile(std::ofstream& out, const T& x) {
     char allocator_buffer[1000];
     std::pmr::monotonic_buffer_resource resource(allocator_buffer, sizeof(allocator_buffer));
     std::pmr::vector<char> buffer{&resource};
@@ -270,7 +275,7 @@ int64_t outputTable(const fs::path& output, auto&& iterable) {
     if (rowsReceived > 0) {
         // write header
         out.seekp(0);
-        writeToFile(out, makeHeader());
+        writeObjectToFile(out, makeHeader());
     } else {
         // delete the file if there were no rows
         // (can probably just check if begin() == end() )
@@ -354,13 +359,17 @@ std::string incrementalGetNewestRowsQuery(const std::string& table, const std::o
 
 // Query rows WHERE the_column >= $yesterday_first_row AND the_column <= $yesterday_last_row
 template<IncrementalTable TABLE>
-std::string incrementalSelectRangeQuery(const std::string& table, const std::string& first, const std::string& last) {
+std::string incrementalSelectRangeQuery(const std::string& table, const std::optional<key_type<TABLE>>& first, const key_type<TABLE>& last) {
     std::string columnName{TABLE::table_type::column::name};
     std::stringstream ss;
     ss
     << "SELECT " << columnNames<TABLE>()  << " FROM " << table
-    << " WHERE " << columnName << " >= " << first << " AND " << columnName << " <= " << last
-    << " ORDER BY " << columnName << " ASC";
+    //<< " WHERE " << columnName << " >= " << first << " AND " << columnName << " <= " << last
+    << " WHERE ";
+    if (first.has_value()) {
+        ss << columnName << " >= " << std::to_string(first.value()) << " AND ";
+    }
+    ss << columnName << " <= " << std::to_string(last) << " ORDER BY " << columnName << " ASC";
 
     return ss.str();
 }
@@ -420,9 +429,9 @@ void backupToday(pqxx::work& tx, const fs::path& outDir, const fs::path& rootOut
 
 
 template<IncrementalTable TABLE>
-void runBackupForRange(pqxx::work& tx, const fs::path& output, const int64_t first, const int64_t last) {
+void runBackupForRange(pqxx::work& tx, const fs::path& output, const std::optional<int64_t>& first, const int64_t last) {
     const auto& table = std::get<TABLE>(tables);
-    const auto query = incrementalSelectRangeQuery<TABLE>(table.name, std::to_string(first), std::to_string(last));
+    const auto query = incrementalSelectRangeQuery<TABLE>(table.name, first, last);
 
     outputTable<TABLE>(output, streamTable<TABLE>(tx, query));
 }
@@ -560,9 +569,9 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
 
             auto currentPos = stream.tellg();
             const std::optional<fs::path> previousOutputFile = getPreviousOutputFile(rootOutput, yesterday.value(), table.name); // 2 days old
-            const auto first = previousOutputFile.has_value() ?
-                getKeyElement<T>(getLastRowOfFile<T>(previousOutputFile.value())) + 1
-              : getKeyElement<T>(readTuple<typename T::tuple>(stream));
+            const std::optional<key_type<T>> first = previousOutputFile.has_value() ?
+                 std::optional{getKeyElement<T>(getLastRowOfFile<T>(previousOutputFile.value())) + 1}
+               : std::nullopt;
 
             stream.seekg(h.lastRowPos);
             const auto last = getKeyElement<T>(readTuple<typename T::tuple>(stream));
@@ -583,17 +592,19 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                 std::cout << "rowsRead = " << rowsRead << std::endl;
 
                 // data is in ascending order
-                const auto& firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first;
+                const std::optional firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first;
                 const auto& lastKey = getKeyElement<T>(fileRows.back());
-                if (firstKey > lastKey) {
-                    throw std::runtime_error{"trolled"};
+
+                std::cout << "table = " << table.name << std::endl;
+                std::cout << "first = " << (firstKey.has_value() ? std::to_string(*firstKey) : std::string{"null"}) << " second = " << lastKey << std::endl;
+                if (firstKey.has_value() && *firstKey > lastKey) {
+                    throw std::runtime_error{"firstKey > lastKey"};
                 }
-                const std::string query = incrementalSelectRangeQuery<T>(table.name, std::to_string(firstKey), std::to_string(lastKey));
+
+                const std::string query = incrementalSelectRangeQuery<T>(table.name, firstKey, lastKey);
                 prevChunkLastKey = getKeyElement<T>(fileRows.back());
                 std::cout << "retry = " << query << std::endl;
 
-                std::cout << "table = " << table.name << std::endl;
-                std::cout << "first = " << firstKey << " second = " << lastKey << std::endl;
 
                 std::vector<typename T::tuple> tuplesFromQuery; // this is the definitely correct data
                 for (auto tuple : streamTable<T>(tx, query)) {
@@ -648,13 +659,17 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                         // this is close to the end and shouldn't be logged
                         std::ofstream out = newOutputStream(file);
                         out.seekp(fileData.firstRowPos);
+                        uint64_t lastRowPos = 0;
                         for (const auto& tuple : tuplesFromQuery) {
+                            lastRowPos = out.tellp();
                             writeTuple(out, tuple);
                         }
-                        // TODO: update lastRowPos because tuplesFromQuery might make the file a bit bigger
+                        out.seekp(Header::lastRowPosOffset());
+
+                        writeObjectToFile(out, lastRowPos);
                     } else {
                         std::cout << "rewriting the whole file" << std::endl;
-                        runBackupForRange<T>(tx, file, first, last);
+                        runBackupForRange<T>(tx, yesterday.value(), first, last);
                     }
                     break;
                 } else {
