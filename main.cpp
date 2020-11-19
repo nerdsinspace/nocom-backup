@@ -557,11 +557,13 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
             // If there were no new rows in a table we do not output a file.
             // Because we can not check if an empty file is correct because we can not put an upper bound on the query.
             if (!fs::exists(file)) return;
+            std::cout << "checking " << file << std::endl;
 
             std::ifstream stream = newInputStream(file);
             const auto h = Serializable<Header>::deserialize(stream);
 
             auto currentPos = stream.tellg();
+            // TODO: should be from the last row of yesterday
             const auto first = getKeyElement<T>(readTuple<typename T::tuple>(stream));
             stream.seekg(h.lastRowPos);
             const auto last = getKeyElement<T>(readTuple<typename T::tuple>(stream));
@@ -569,6 +571,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
 
             // TODO: check if file has no rows (shouldn't ever happen)
 
+            std::optional<key_type<T>> prevChunkLastKey; // null on first iteration
             for (uint64_t rowsRead = 0; rowsRead < h.numRows;) {
                 constexpr uint64_t ROW_LIMIT = 10'000'000;
 
@@ -577,14 +580,17 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                 const auto fileData = TableData<T>::readRows(stream, n);
                 const auto& fileRows = fileData.rows;
                 rowsRead += fileRows.size();
+                std::cout << "fetched " << fileRows.size() << " rows from file" << std::endl;
+                std::cout << "rowsRead = " << rowsRead << std::endl;
 
                 // data is in ascending order
-                const auto& firstKey = getKeyElement<T>(fileRows.front());
+                const auto& firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first;
                 const auto& lastKey = getKeyElement<T>(fileRows.back());
                 if (firstKey > lastKey) {
                     throw std::runtime_error{"trolled"};
                 }
                 const std::string query = incrementalSelectRangeQuery<T>(table.name, std::to_string(firstKey), std::to_string(lastKey));
+                prevChunkLastKey = getKeyElement<T>(fileRows.back());
                 std::cout << "retry = " << query << std::endl;
 
                 std::cout << "table = " << table.name << std::endl;
@@ -646,6 +652,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                         for (const auto& tuple : tuplesFromQuery) {
                             writeTuple(out, tuple);
                         }
+                        // TODO: update lastRowPos because tuplesFromQuery might make the file a bit bigger
                     } else {
                         std::cout << "rewriting the whole file" << std::endl;
                         runBackupForRange<T>(tx, file, first, last);
