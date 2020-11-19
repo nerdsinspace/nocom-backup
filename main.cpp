@@ -29,6 +29,7 @@ struct Header {
     uint32_t version = CURRENT_VERSION;
     uint64_t numRows{};
     int64_t lastRowPos = -1; // byte position in the file of the last row
+    // TODO: re add bounds from the original query
 
     static constexpr int SIZE = sizeof(version) + sizeof(numRows) + sizeof(lastRowPos);
 
@@ -145,35 +146,22 @@ std::optional<fs::path> getNewestOutput(const fs::path& dir, const fs::path& tod
 }
 
 
-// oldest -> newest
-std::vector<fs::path> getTableFilesSorted(const fs::path& output, std::string_view tableName) {
-    std::vector<fs::path> files;
-    for (const auto& p : fs::directory_iterator{output}) {
-        const auto name = p.path().filename().string();
-        if (name.find(tableName) == 0) {
-            files.push_back(p);
-        }
-    }
-
-    const auto fileNumber = [&](const fs::path& p) -> int {
-        auto numStr = p.string().substr(tableName.length());
-        return !numStr.empty() ? std::stoi(numStr) : 0;
-    };
-    std::ranges::sort(files, {}, fileNumber);
-
-    return files;
-}
-
-std::optional<fs::path> getNewestFileForTableInOutput(const fs::path& output, std::string_view tableName) {
-    std::vector<fs::path> files = getTableFilesSorted(output, tableName);
-    if (files.empty()) return {};
-    else return files.back();
-}
-
-std::optional<fs::path> getNewestFileForTable(const std::vector<fs::path>& outputsSorted, std::string_view tableName) {
+std::optional<fs::path> getNewestFileForTable(std::span<const fs::path> outputsSorted, std::string_view tableName) {
     for (const auto& p : outputsSorted) {
-        std::optional file = getNewestFileForTableInOutput(p, tableName);
-        if (file) return file.value();
+        fs::path file = p / tableName;
+        if (fs::exists(file)) return file;
+    }
+    return {};
+}
+
+std::optional<fs::path> getPreviousOutputFile(const fs::path& rootOutput, const fs::path& output, std::string_view tableName) {
+    const std::vector<fs::path> allOutputs = getAllOutputsSorted(rootOutput);
+    const auto endIt = std::ranges::find(allOutputs, output);
+
+    // slightly weird way to use iterators because im afraid to use reverse iterators
+    for (auto it = std::prev(endIt); it != std::prev(allOutputs.begin()); it--) {
+        auto p = *it / tableName;
+        if (fs::exists(p)) return p;
     }
     return {};
 }
@@ -270,13 +258,13 @@ int64_t outputTable(const fs::path& output, auto&& iterable) {
     };
     // TODO: measure throughput
     for (const auto& tuple : iterable) {
+        //std::cout << tuple << std::endl;
         lastRowPosition = out.tellp();
         writeTuple(out, tuple);
         rowsReceived++;
         if (rowsReceived > 0 && rowsReceived % 10'000'000 == 0) {
             std::cout << rowsReceived << " rows..." << std::endl;
         }
-        //if (rowsReceived >= 10'000) break;
     }
     std::cout << rowsReceived << " rows!!" << std::endl;
     if (rowsReceived > 0) {
@@ -547,6 +535,14 @@ bool unorderedEqual(std::span<const T> a, std::span<const T> b) {
     return true;
 }
 
+template<IncrementalTable TABLE>
+auto getLastRowOfFile(const fs::path& file) {
+    std::ifstream in = newInputStream(file);
+    const Header h = Serializable<Header>::deserialize(in);
+    in.seekg(h.lastRowPos);
+    return readTuple<typename TABLE::tuple>(in);
+}
+
 void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
     const std::optional<fs::path> yesterday = getNewestOutput(rootOutput, today);
     if (!yesterday.has_value()) return;
@@ -563,8 +559,11 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
             const auto h = Serializable<Header>::deserialize(stream);
 
             auto currentPos = stream.tellg();
-            // TODO: should be from the last row of yesterday
-            const auto first = getKeyElement<T>(readTuple<typename T::tuple>(stream));
+            const std::optional<fs::path> previousOutputFile = getPreviousOutputFile(rootOutput, yesterday.value(), table.name); // 2 days old
+            const auto first = previousOutputFile.has_value() ?
+                getKeyElement<T>(getLastRowOfFile<T>(previousOutputFile.value()))
+              : getKeyElement<T>(readTuple<typename T::tuple>(stream));
+
             stream.seekg(h.lastRowPos);
             const auto last = getKeyElement<T>(readTuple<typename T::tuple>(stream));
             stream.seekg(currentPos);
@@ -584,7 +583,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                 std::cout << "rowsRead = " << rowsRead << std::endl;
 
                 // data is in ascending order
-                const auto& firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first;
+                const auto& firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first + 1;
                 const auto& lastKey = getKeyElement<T>(fileRows.back());
                 if (firstKey > lastKey) {
                     throw std::runtime_error{"trolled"};
@@ -655,7 +654,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                         // TODO: update lastRowPos because tuplesFromQuery might make the file a bit bigger
                     } else {
                         std::cout << "rewriting the whole file" << std::endl;
-                        runBackupForRange<T>(tx, file, first, last);
+                        runBackupForRange<T>(tx, file, first + 1, last);
                     }
                     break;
                 } else {
