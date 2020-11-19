@@ -561,7 +561,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
             auto currentPos = stream.tellg();
             const std::optional<fs::path> previousOutputFile = getPreviousOutputFile(rootOutput, yesterday.value(), table.name); // 2 days old
             const auto first = previousOutputFile.has_value() ?
-                getKeyElement<T>(getLastRowOfFile<T>(previousOutputFile.value()))
+                getKeyElement<T>(getLastRowOfFile<T>(previousOutputFile.value())) + 1
               : getKeyElement<T>(readTuple<typename T::tuple>(stream));
 
             stream.seekg(h.lastRowPos);
@@ -583,7 +583,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                 std::cout << "rowsRead = " << rowsRead << std::endl;
 
                 // data is in ascending order
-                const auto& firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first + 1;
+                const auto& firstKey = prevChunkLastKey.has_value() ? (*prevChunkLastKey + 1) : first;
                 const auto& lastKey = getKeyElement<T>(fileRows.back());
                 if (firstKey > lastKey) {
                     throw std::runtime_error{"trolled"};
@@ -633,7 +633,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                     std::cout << rowNumDif << " new rows!!" << std::endl;
                 } else if (rowNumDif < 0) {
                     // we somehow LOST rows??
-                    std::cout << "We somehow lost " << rowNumDif << " rows in an append only table" << std::endl;
+                    std::cout << "We somehow lost " << -rowNumDif << " rows in an append only table" << std::endl;
 
                     throw std::runtime_error{"UHH OH STINKY WE LOST DATA THIS IS NOT GOOD!!!"};
                 }
@@ -654,7 +654,7 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
                         // TODO: update lastRowPos because tuplesFromQuery might make the file a bit bigger
                     } else {
                         std::cout << "rewriting the whole file" << std::endl;
-                        runBackupForRange<T>(tx, file, first + 1, last);
+                        runBackupForRange<T>(tx, file, first, last);
                     }
                     break;
                 } else {
