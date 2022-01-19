@@ -14,6 +14,7 @@
 
 #include <pqxx/pqxx>
 #include <args.hxx>
+#include <simdjson.h>
 
 #include "pqxx_extensions.h"
 #include "tables.h"
@@ -681,26 +682,73 @@ void part2(pqxx::work& tx, const fs::path& rootOutput, const fs::path& today) {
     }, tables);
 }
 
+void readChatTable(pqxx::work& tx) {
+    using namespace simdjson;
+    using namespace string_view_literals;
+    ondemand::parser parser;
+
+    uint64_t bytes = 0;
+    uint64_t dups = 0;
+    uint64_t unique = 0;
+    std::string prevData; // unparsed
+    uint64_t prevCreatedAt = 0;
+    for (auto [data, reportedBy, createdAt, serverId] : tx.stream<std::string, int32_t, int64_t, int16_t>("SELECT data, reported_by, created_at, server_id FROM chat WHERE chat_type=0 ORDER BY created_at")) {
+    //for (auto [data, type, reportedBy, createdAt, serverId] : streamTable<Chat>(tx, "SELECT * FROM chat WHERE chat_type=0 ORDER BY created_at")) {
+        bytes += data.size();
+        if (createdAt - prevCreatedAt < 1000 && data == prevData) {
+            // duplicate if it's the same data and received in the same second
+            dups++;
+        } else {
+            unique++;
+            padded_string json{data};
+            ondemand::document nbt = parser.iterate(json);
+            ondemand::array extra;
+            auto error = nbt["extra"sv].get(extra);
+            if (error == SUCCESS) { // this is an in game chat message (death message or player message)
+                std::string out;
+                for (auto object : extra) {
+                    auto text = std::string_view(object["text"sv]);
+                    out += text;
+                }
+                if (out.find("whispers:") != std::string::npos) {
+                    std::cout << data << '\n';
+                }
+            } else {
+                std::string_view text = std::string_view(nbt["text"sv]);
+            }
+        }
+
+        prevCreatedAt = createdAt;
+        prevData = std::move(data);
+        //std::cout << '\n';
+        //std::cout << data << '\n';
+    }
+    std::cout << "Read " << bytes << " bytes\n";
+    std::cout << dups << " duplicates\n";
+    std::cout << unique << " unique messages\n";
+}
+
 int main(int argc, char** argv)
 {
     try {
-        pqxx::connection con;
+        pqxx::connection con{"postgres://nocom:<redacted>>@localhost:5432/nocom?sslmode=disable"};
         std::cout << "Connected to " << con.dbname() << std::endl;
 
-        const auto now = std::chrono::system_clock::now();
+        /*const auto now = std::chrono::system_clock::now();
         const uint64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
         const auto rootOutput = fs::path{"output"};
         const auto out = rootOutput / std::to_string(millis); // output for today
         std::cout << "Creating output directory at " << out << std::endl;
-        fs::create_directories(out);
+        fs::create_directories(out);*/
 
         auto t0 = std::chrono::system_clock::now();
 
         pqxx::work transaction{con};
 
-        backupToday(transaction, out, rootOutput);
-        part2(transaction, rootOutput, out);
+        //backupToday(transaction, out, rootOutput);
+        //part2(transaction, rootOutput, out);
+        readChatTable(transaction);
 
         auto t1 = std::chrono::system_clock::now();
 
